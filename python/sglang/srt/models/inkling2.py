@@ -164,9 +164,12 @@ class Inkling2DecoderLayer(nn.Module):
         )
         attention = self.attn(attn_input, positions, forward_batch, pass_idx=pass_idx)
         attention = self.attn_sconv(attention, positions, forward_batch)
-        routed = forward_batch.forward_mode.is_decode() or (
-            forward_batch.forward_mode.is_target_verify()
-            and attention.shape[0] <= VERIFY_ROUTED_EPILOGUE_MAX_TOKENS
+        routed = not get_platform().is_xpu and (
+            forward_batch.forward_mode.is_decode()
+            or (
+                forward_batch.forward_mode.is_target_verify()
+                and attention.shape[0] <= VERIFY_ROUTED_EPILOGUE_MAX_TOKENS
+            )
         )
         tokens = attention.shape[0]
         # MTP verify and loop message mixing keep every row.
@@ -190,9 +193,13 @@ class Inkling2DecoderLayer(nn.Module):
             combine=not routed,
             total_tokens=tokens if rows is not None else None,
         )
-        if isinstance(mlp, torch.Tensor) and (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
+        if (
+            not get_platform().is_xpu
+            and isinstance(mlp, torch.Tensor)
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
         ):
             mlp = RoutedOutput(mlp, None, 0)
         if isinstance(mlp, RoutedOutput):
@@ -214,6 +221,11 @@ class _Fp32AsBf16Gather:
         self.gatherer = gatherer
 
     def __call__(self, x):
+        # Eager XPU logits can reach XCCL while their Triton producer is still
+        # pending. Drain the producer stream at this handoff. Capture records
+        # the producer/collective dependencies and must not perform a host wait.
+        if x.device.type == "xpu" and not torch.xpu.is_current_stream_capturing():
+            torch.xpu.current_stream(x.device).synchronize()
         if x.dtype != torch.float32 or x.dim() != 2:
             return self.gatherer(x)
         return self.gatherer(x.view(torch.bfloat16)).view(torch.float32)
@@ -225,7 +237,7 @@ class Inkling2LogitsProcessor(LogitsProcessor):
         self.vocab_size = config.padded_vocab_size
         self.input_logprob_processor.vocab_size = self.vocab_size
         # SM120 has no NVLink multicast: gather over NCCL, never rendezvous symm mem.
-        if get_platform().is_sm120:
+        if get_platform().is_sm120 or get_platform().is_xpu:
             self._logits_gatherer = MultimemAllGatherer(max_tokens=0, enabled=False)
         self.use_fp32_lm_head = output_dtype == torch.float32
         # FP32 logits: softcap each rank's vocab shard before the gather, and

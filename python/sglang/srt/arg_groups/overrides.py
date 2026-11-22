@@ -455,12 +455,10 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
-    if get_platform().is_xpu:
+    if get_platform().is_xpu and hf_config.architectures[0] not in INKLING2_ARCHS:
         return False
     if hf_config.architectures[0] == "Lfm3ForCausalLM" and get_platform().is_hip:
         # HIP has no extra-buffer hand-off for LFM3 conv-state checkpointing.
-        return False
-    if get_platform().is_xpu:
         return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
