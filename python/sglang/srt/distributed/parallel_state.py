@@ -744,9 +744,8 @@ class GroupCoordinator:
             # an opaque call and does not decompose it into _c10d_functional primitives
             # (which invoke sycl_event.wait() and break XPU graph capture).
             # Keeps the operation in-place; the all-reduce is performed by
-            # _all_reduce_in_place, which for XPU falls through to
-            # torch.distributed.all_reduce on self.device_group (the same group
-            # used by xpu_communicator).
+            # _all_reduce_in_place through xpu_communicator, which runs
+            # torch.distributed.all_reduce on self.device_group.
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
@@ -1113,6 +1112,8 @@ class GroupCoordinator:
             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             torch_symm_mem_comm.all_reduce(input_, out=input_)
+        elif self.xpu_communicator is not None and not self.xpu_communicator.disabled:
+            self.xpu_communicator.all_reduce(input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
