@@ -667,3 +667,12 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("inkling2_xpu")
+def create_inkling2_xpu_backend(runner):
+    from sglang.srt.layers.attention.inkling2_xpu_backend import (
+        Inkling2XPUAttentionBackend,
+    )
+
+    return Inkling2XPUAttentionBackend(runner)

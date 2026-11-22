@@ -1,0 +1,627 @@
+"""Paged relative-logit attention, ported from Inkling's online-softmax path."""
+
+import functools
+
+import torch
+import triton
+import triton.language as tl
+
+
+# T affects output offsets only; alignment must not create another binary.
+@triton.jit(do_not_specialize=["T"])
+def _relative_paged(
+    Q,
+    K,
+    V,
+    Rel,
+    Pages,
+    Lengths,
+    CuQ,
+    O,
+    L,
+    SQ0: tl.constexpr,
+    SQ1: tl.constexpr,
+    SK0: tl.constexpr,
+    SK1: tl.constexpr,
+    SK2: tl.constexpr,
+    SV0: tl.constexpr,
+    SV1: tl.constexpr,
+    SV2: tl.constexpr,
+    SR0: tl.constexpr,
+    SR1: tl.constexpr,
+    SP,
+    T,
+    H: tl.constexpr,
+    HK: tl.constexpr,
+    D: tl.constexpr,
+    E: tl.constexpr,
+    PAGE: tl.constexpr,
+    LEFT: tl.constexpr,
+    SCALE: tl.constexpr,
+    SPLITS: tl.constexpr,
+    HAS_REL: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    ANCHORED: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    qt = tl.program_id(0)
+    head_split = tl.program_id(1)
+    head, split = head_split // SPLITS, head_split % SPLITS
+    req = tl.program_id(2)
+    start = tl.load(CuQ + req)
+    end = tl.load(CuQ + req + 1)
+    qlen = end - start
+    if qt * BM >= qlen:
+        return
+    length = tl.load(Lengths + req)
+    row = qt * BM + tl.arange(0, BM)
+    token = start + row
+    pos = length - qlen + row
+    dim = tl.arange(0, D)
+    query = tl.load(
+        Q + token[:, None] * SQ0 + head * SQ1 + dim[None, :],
+        row[:, None] < qlen,
+        other=0.0,
+    )
+    kvhead = head // (H // HK)
+    maximum = tl.full((BM,), -float("inf"), tl.float32)
+    denom = tl.zeros((BM,), tl.float32)
+    result = tl.zeros((BM, D), tl.float32)
+    low = 0
+    anchor_start = 0
+    if LEFT >= 0:
+        if ANCHORED:
+            anchor_start = tl.maximum(length - qlen - (LEFT + 1), 0)
+            low = anchor_start // BN
+        else:
+            low = tl.maximum(length - qlen + qt * BM - LEFT, 0) // BN
+    if CAUSAL:
+        high = tl.cdiv(tl.minimum(length - qlen + (qt + 1) * BM, length), BN)
+    else:
+        high = tl.cdiv(length, BN)
+    for block in range(low + split, high, SPLITS):
+        keypos = block * BN + tl.arange(0, BN)
+        validkeys = keypos < length
+        page = tl.load(Pages + req * SP + keypos // PAGE, validkeys, other=0).to(
+            tl.int64
+        )
+        keyptr = (
+            K
+            + page[:, None] * SK0
+            + (keypos % PAGE)[:, None] * SK1
+            + kvhead * SK2
+            + dim[None, :]
+        )
+        valptr = (
+            V
+            + page[:, None] * SV0
+            + (keypos % PAGE)[:, None] * SV1
+            + kvhead * SV2
+            + dim[None, :]
+        )
+        keys = tl.load(keyptr, validkeys[:, None], other=0.0)
+        values = tl.load(valptr, validkeys[:, None], other=0.0)
+        score = tl.dot(query, tl.trans(keys)) * SCALE
+        distance = pos[:, None] - keypos[None, :]
+        visible = (row[:, None] < qlen) & validkeys[None, :]
+        if CAUSAL:
+            visible = visible & (distance >= 0)
+        if LEFT >= 0:
+            if ANCHORED:
+                visible = visible & (keypos[None, :] >= anchor_start)
+            else:
+                visible = visible & (distance <= LEFT)
+        if HAS_REL:
+            bias = tl.load(
+                Rel + token[:, None] * SR0 + head * SR1 + distance,
+                visible & (distance >= 0) & (distance < E),
+                other=0.0,
+            ).to(tl.float32)
+            score = score + bias
+        score = tl.where(visible, score, -float("inf"))
+        newmax = tl.maximum(maximum, tl.max(score, 1))
+        alpha = tl.where(maximum > -float("inf"), tl.exp(maximum - newmax), 0.0)
+        probs = tl.where(visible, tl.exp(score - newmax[:, None]), 0.0)
+        denom = denom * alpha + tl.sum(probs, 1)
+        result = result * alpha[:, None] + tl.dot(probs.to(values.dtype), values)
+        maximum = newmax
+    normal = tl.where(denom > 0.0, denom, 1.0)
+    result = result / normal[:, None]
+    lse = tl.where(denom > 0.0, maximum + tl.log(normal), -float("inf"))
+    outbase = split * T * H * D + token[:, None] * H * D + head * D + dim[None, :]
+    tl.store(O + outbase, result, row[:, None] < qlen)
+    tl.store(L + split * T * H + token * H + head, lse, row < qlen)
+
+
+PACKED_PAGE = 64
+# Page sizes the native Xe20 paged flash attention supports.
+NATIVE_FA_PAGES = (64, 128)
+# (max packed rows, BN, warps) per launch kind, measured on B70 at 24/8 heads
+# (verify: 9 rows; prefill: 2K-4K token chunks).
+PACKED_CONFIG = {
+    "window": (64, 16, 8),
+    "global": (64, 16, 4),
+    "prefill": (64, 16, 8),
+}
+
+
+@triton.jit
+def _packed_block(
+    query,
+    maximum,
+    denom,
+    result,
+    block,
+    K,
+    V,
+    Rel,
+    Pages,
+    req,
+    kvhead,
+    token,
+    head,
+    pos,
+    live,
+    length,
+    SP,
+    SK0,
+    SK1,
+    SK2,
+    SV0,
+    SV1,
+    SV2,
+    SR0,
+    SR1,
+    D: tl.constexpr,
+    E: tl.constexpr,
+    PAGE: tl.constexpr,
+    LEFT: tl.constexpr,
+    SCALE: tl.constexpr,
+    WITH_REL: tl.constexpr,
+    BN: tl.constexpr,
+):
+    keypos = block * BN + tl.arange(0, BN)
+    validkeys = keypos < length
+    # PAGE % BN == 0: the block sits inside one page, read with 2D block loads.
+    page = tl.load(Pages + req * SP + block * BN // PAGE).to(tl.int64)
+    slot = block * BN % PAGE
+    keys = tl.load(
+        tl.make_block_ptr(
+            K + page * SK0 + kvhead * SK2,
+            (PAGE, D),
+            (SK1, 1),
+            (slot, 0),
+            (BN, D),
+            (1, 0),
+        )
+    )
+    values = tl.load(
+        tl.make_block_ptr(
+            V + page * SV0 + kvhead * SV2,
+            (PAGE, D),
+            (SV1, 1),
+            (slot, 0),
+            (BN, D),
+            (1, 0),
+        )
+    )
+    # Unwritten slots past the length may hold NaN; zero probabilities cannot mask them.
+    values = tl.where(validkeys[:, None], values, 0.0)
+    score = tl.dot(query, tl.trans(keys)) * SCALE
+    distance = pos[:, None] - keypos[None, :]
+    visible = live[:, None] & validkeys[None, :] & (distance >= 0)
+    if LEFT >= 0:
+        visible = visible & (distance <= LEFT)
+    if WITH_REL:
+        bias = tl.load(
+            Rel + token[:, None] * SR0 + head[:, None] * SR1 + distance,
+            visible & (distance < E),
+            other=0.0,
+        ).to(tl.float32)
+        score = score + bias
+    score = tl.where(visible, score, -float("inf"))
+    newmax = tl.maximum(maximum, tl.max(score, 1))
+    alpha = tl.where(maximum > -float("inf"), tl.exp(maximum - newmax), 0.0)
+    probs = tl.where(visible, tl.exp(score - newmax[:, None]), 0.0)
+    denom = denom * alpha + tl.sum(probs, 1)
+    result = result * alpha[:, None] + tl.dot(probs.to(values.dtype), values)
+    return newmax, denom, result
+
+
+# Decode/verify: the GROUP query heads of one KV head and all query rows of the
+# request share an M tile, so each K/V block is read once per KV head and split.
+# Blocks farther than E keys from every query row carry no relative bias.
+@triton.jit(do_not_specialize=["T"])
+def _relative_paged_packed(
+    Q,
+    K,
+    V,
+    Rel,
+    Pages,
+    Lengths,
+    CuQ,
+    O,
+    L,
+    SQ0: tl.constexpr,
+    SQ1: tl.constexpr,
+    SK0: tl.constexpr,
+    SK1: tl.constexpr,
+    SK2: tl.constexpr,
+    SV0: tl.constexpr,
+    SV1: tl.constexpr,
+    SV2: tl.constexpr,
+    SR0: tl.constexpr,
+    SR1: tl.constexpr,
+    SP,
+    T,
+    H: tl.constexpr,
+    GROUP: tl.constexpr,
+    D: tl.constexpr,
+    E: tl.constexpr,
+    PAGE: tl.constexpr,
+    LEFT: tl.constexpr,
+    SCALE: tl.constexpr,
+    SPLITS: tl.constexpr,
+    HAS_REL: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+):
+    qtile = tl.program_id(0)
+    kvhead = tl.program_id(1) // SPLITS
+    split = tl.program_id(1) % SPLITS
+    req = tl.program_id(2)
+    start = tl.load(CuQ + req)
+    qlen = tl.load(CuQ + req + 1) - start
+    # Each tile holds TILE_Q query rows of all GROUP heads (TILE_Q = BM // GROUP).
+    first_q = qtile * (BM // GROUP)
+    if first_q >= qlen:
+        return
+    length = tl.load(Lengths + req)
+    packed = tl.arange(0, BM)
+    qi = first_q + packed // GROUP
+    head = kvhead * GROUP + packed % GROUP
+    live = (qi < qlen) & (packed < (BM // GROUP) * GROUP)
+    token = start + qi
+    pos = length - qlen + qi
+    dim = tl.arange(0, D)
+    query = tl.load(
+        Q + token[:, None] * SQ0 + head[:, None] * SQ1 + dim[None, :],
+        live[:, None],
+        other=0.0,
+    )
+    maximum = tl.full((BM,), -float("inf"), tl.float32)
+    denom = tl.zeros((BM,), tl.float32)
+    result = tl.zeros((BM, D), tl.float32)
+    first_pos = length - qlen + first_q
+    last_pos = tl.minimum(first_pos + BM // GROUP, length) - 1
+    low = 0
+    if LEFT >= 0:
+        low = tl.maximum(first_pos - LEFT, 0) // BN
+    high = last_pos // BN + 1
+    near = high
+    if HAS_REL:
+        near = tl.minimum(tl.maximum(first_pos - E, 0) // BN, high)
+        near = tl.maximum(near, low)
+    for block in range(low + split, near, SPLITS):
+        maximum, denom, result = _packed_block(
+            query,
+            maximum,
+            denom,
+            result,
+            block,
+            K,
+            V,
+            Rel,
+            Pages,
+            req,
+            kvhead,
+            token,
+            head,
+            pos,
+            live,
+            length,
+            SP,
+            SK0,
+            SK1,
+            SK2,
+            SV0,
+            SV1,
+            SV2,
+            SR0,
+            SR1,
+            D,
+            E,
+            PAGE,
+            LEFT,
+            SCALE,
+            False,
+            BN,
+        )
+    if HAS_REL:
+        first = near + (split - (near - low) % SPLITS + SPLITS) % SPLITS
+        for block in range(first, high, SPLITS):
+            maximum, denom, result = _packed_block(
+                query,
+                maximum,
+                denom,
+                result,
+                block,
+                K,
+                V,
+                Rel,
+                Pages,
+                req,
+                kvhead,
+                token,
+                head,
+                pos,
+                live,
+                length,
+                SP,
+                SK0,
+                SK1,
+                SK2,
+                SV0,
+                SV1,
+                SV2,
+                SR0,
+                SR1,
+                D,
+                E,
+                PAGE,
+                LEFT,
+                SCALE,
+                True,
+                BN,
+            )
+    normal = tl.where(denom > 0.0, denom, 1.0)
+    result = result / normal[:, None]
+    lse = tl.where(denom > 0.0, maximum + tl.log(normal), -float("inf"))
+    outbase = (
+        split * T * H * D + token[:, None] * H * D + head[:, None] * D + dim[None, :]
+    )
+    tl.store(O + outbase, result, live[:, None])
+    tl.store(L + split * T * H + token * H + head, lse, live)
+
+
+@triton.jit
+def _merge_splits(
+    O,
+    L,
+    Out,
+    OutL,
+    TH,
+    SPLITS: tl.constexpr,
+    SPLITS_POW2: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Out[t, h] = sum_s exp(L[s] - lse) O[s] with lse = logsumexp_s L[s]."""
+    row = tl.program_id(0).to(tl.int64)
+    split = tl.arange(0, SPLITS_POW2)
+    lse = tl.load(L + split * TH + row, split < SPLITS, other=-float("inf"))
+    maximum = tl.max(lse, 0)
+    stable = tl.where(maximum > -float("inf"), maximum, 0.0)
+    weight = tl.where(lse > -float("inf"), tl.exp(lse - stable), 0.0)
+    denom = tl.sum(weight, 0)
+    dim = tl.arange(0, D)
+    parts = tl.load(
+        O + (split[:, None] * TH + row) * D + dim[None, :],
+        (split < SPLITS)[:, None],
+        other=0.0,
+    )
+    merged = tl.sum(parts * weight[:, None], 0) / tl.maximum(
+        denom, 1.1754943508222875e-38
+    )
+    tl.store(Out + row * D + dim, merged)
+    tl.store(
+        OutL + row,
+        tl.where(maximum > -float("inf"), stable + tl.log(denom), -float("inf")),
+    )
+
+
+def _native_relative_prefill(
+    q,
+    key_cache,
+    value_cache,
+    rel_bias,
+    page_table,
+    cache_lengths,
+    cu_q,
+    max_query_length,
+    max_cache_length,
+    scale,
+    window_left,
+):
+    """Causal paged prefill on the native Xe20 relative-attention kernel; returns
+    BF16 (tokens, heads, dim) and FP32 (tokens, heads) lse as a strided view."""
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    out, lse = flash_attn_with_kvcache(
+        q,
+        key_cache,
+        value_cache,
+        cache_seqlens=cache_lengths,
+        page_table=page_table,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max_query_length,
+        # The bias shear skips sequences longer than max_seqlen_k.
+        max_seqlen_k=max_cache_length,
+        causal=True,
+        window_size=(window_left, 0),
+        softmax_scale=scale,
+        rel_bias=rel_bias,
+        return_softmax_lse=True,
+    )
+    return out, lse.transpose(0, 1)
+
+
+@functools.cache
+def native_relative_lse_supported() -> bool:
+    try:
+        from sgl_kernel import flash_attn
+    except ImportError:
+        return False
+    # Older sgl-kernel-xpu builds reject return_softmax_lse with rel_bias.
+    return getattr(flash_attn, "REL_BIAS_LSE_SUPPORTED", False)
+
+
+def relative_paged_attention(
+    q,
+    key_cache,
+    value_cache,
+    rel_bias,
+    page_table,
+    cache_lengths,
+    cu_q,
+    *,
+    max_query_length,
+    scale,
+    window_left=-1,
+    splits=1,
+    causal=True,
+    window_anchor_at_start=False,
+    max_cache_length=None,
+):
+    """Returns (out, lse): out (tokens, heads, dim), FP32 from the Triton kernels and
+    BF16 from the native prefill kernel; lse FP32 (tokens, heads), possibly strided.
+    max_cache_length (host int, >= every cache length) enables the native prefill."""
+    if q.device.type != "xpu" or q.dtype != torch.bfloat16:
+        raise ValueError("Inkling XPU relative attention requires BF16 XPU queries")
+    if key_cache.dtype != q.dtype or value_cache.dtype != q.dtype:
+        raise NotImplementedError(
+            "Native Inkling KV formats need a separate validated reader"
+        )
+    t, heads, dim = q.shape
+    pages, page_size, kvheads, kd = key_cache.shape
+    if dim != kd or value_cache.shape != key_cache.shape or heads % kvheads:
+        raise ValueError("Incompatible GQA/cache shape")
+    if window_anchor_at_start and (causal or window_left < 0):
+        raise ValueError("An anchored window requires noncausal local attention")
+    if not causal and window_left >= 0 and not window_anchor_at_start:
+        raise NotImplementedError(
+            "Bidirectional local attention requires an explicit anchor"
+        )
+    if rel_bias is not None and (
+        rel_bias.shape[:2] != (t, heads) or not rel_bias.is_contiguous()
+    ):
+        rel_bias = rel_bias.contiguous()
+        if rel_bias.shape[:2] != (t, heads):
+            raise ValueError("Relative logits must be [tokens, heads, extent]")
+    splits = max(1, int(splits))
+    out = torch.empty((splits, t, heads, dim), device=q.device, dtype=torch.float32)
+    lse = torch.empty((splits, t, heads), device=q.device, dtype=torch.float32)
+    group = heads // kvheads
+    packed_rows = max(16, triton.next_power_of_2(max_query_length * group))
+    kind = "prefill" if packed_rows > 64 else "window" if window_left >= 0 else "global"
+    max_rows, block_n, warps = PACKED_CONFIG[kind]
+    packed_rows = min(packed_rows, max_rows)
+    common = (
+        q.stride(0),
+        q.stride(1),
+        *key_cache.stride()[:3],
+        *value_cache.stride()[:3],
+        *(rel_bias.stride()[:2] if rel_bias is not None else (0, 0)),
+        page_table.stride(0),
+    )
+    extent = rel_bias.shape[2] if rel_bias is not None else 0
+    if (
+        t
+        and causal
+        and kind == "prefill"
+        and rel_bias is not None
+        and splits == 1
+        and max_cache_length is not None
+        and dim == 128
+        and page_size in NATIVE_FA_PAGES
+        and native_relative_lse_supported()
+    ):
+        return _native_relative_prefill(
+            q,
+            key_cache,
+            value_cache,
+            rel_bias,
+            page_table,
+            cache_lengths,
+            cu_q,
+            max_query_length,
+            max_cache_length,
+            scale,
+            window_left,
+        )
+    if t and causal and page_size % block_n == 0:
+        tiles = triton.cdiv(max_query_length, packed_rows // group)
+        _relative_paged_packed[(tiles, kvheads * splits, cu_q.numel() - 1)](
+            q,
+            key_cache,
+            value_cache,
+            rel_bias,
+            page_table,
+            cache_lengths,
+            cu_q,
+            out,
+            lse,
+            *common,
+            t,
+            heads,
+            group,
+            dim,
+            extent,
+            page_size,
+            window_left,
+            scale,
+            splits,
+            rel_bias is not None,
+            packed_rows,
+            block_n,
+            num_warps=warps,
+            enable_fp_fusion=False,
+        )
+    elif t:
+        _relative_paged[
+            (triton.cdiv(max_query_length, 16), heads * splits, cu_q.numel() - 1)
+        ](
+            q,
+            key_cache,
+            value_cache,
+            rel_bias,
+            page_table,
+            cache_lengths,
+            cu_q,
+            out,
+            lse,
+            *common,
+            t,
+            heads,
+            kvheads,
+            dim,
+            extent,
+            page_size,
+            window_left,
+            scale,
+            splits,
+            rel_bias is not None,
+            causal,
+            window_anchor_at_start,
+            16,
+            64,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    if splits == 1:
+        return out[0], lse[0]
+    merged = torch.empty((t, heads, dim), device=q.device, dtype=torch.float32)
+    merged_lse = torch.empty((t, heads), device=q.device, dtype=torch.float32)
+    if t:
+        _merge_splits[(t * heads,)](
+            out,
+            lse,
+            merged,
+            merged_lse,
+            t * heads,
+            splits,
+            triton.next_power_of_2(splits),
+            dim,
+            num_warps=4,
+        )
+    return merged, merged_lse
