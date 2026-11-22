@@ -22,7 +22,10 @@ class RMSNorm(nn.Module):
         self.pre_weight = nn.Parameter(torch.ones(hidden_size)) if pre_affine else None
 
     def forward(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-        from sglang.kernels.ops.layernorm.inkling2_rms_norm import rms_norm
+        if x.device.type == "xpu":
+            from sglang.kernels.ops.layernorm.inkling2_rms_norm_xpu import rms_norm
+        else:
+            from sglang.kernels.ops.layernorm.inkling2_rms_norm import rms_norm
 
         return rms_norm(
             x,
