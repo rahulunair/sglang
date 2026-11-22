@@ -39,6 +39,7 @@ from sglang.kernels.ops.gemm.inkling2_nvfp4 import (
 )
 from sglang.kernels.ops.moe import inkling2_experts_sm90 as experts_sm90
 from sglang.kernels.ops.moe import inkling2_experts_sm120 as experts_sm120
+from sglang.kernels.ops.moe import inkling2_experts_xpu
 from sglang.kernels.ops.moe.inkling2_moe import (
     routed_partial,
     routed_rows,
@@ -244,7 +245,7 @@ class Inkling2Experts(nn.Module):
         self.gate_cap, self.up_cap = config.mlp_gate_softcap, config.mlp_up_softcap
         platform = get_platform()
         # SM120 has no NVLink multicast.
-        self.multicast_combine = not platform.is_sm120
+        self.multicast_combine = not platform.is_sm120 and not platform.is_xpu
         self.output_sizes = {"w13": 2 * intermediate, "w2": config.hidden_size}
         self._marlin = {}
         self.max_routed_ids = min(
@@ -294,6 +295,8 @@ class Inkling2Experts(nn.Module):
         self.use_marlin = platform.is_sm90 or (
             platform.is_sm120 and not self.native_sm120
         )
+        if platform.is_xpu:
+            inkling2_experts_xpu.check_native_experts(self)
 
     def _empty_weight(self, shape, dtype):
         if (
@@ -337,6 +340,8 @@ class Inkling2Experts(nn.Module):
         return self.mega is not None and (low > high or self.mega.min_tokens <= low)
 
     def prepare_routed_exchange(self):
+        if get_platform().is_xpu:
+            return
         if self.ep_size == 1 or self.use_marlin:
             return
         group, hidden = get_parallel().moe_ep_group, self.w2_weight.shape[1]
@@ -608,6 +613,19 @@ class Inkling2Experts(nn.Module):
             )
 
     def forward(self, x, weights, ids, combine=True):
+        if get_platform().is_xpu:
+            # The XPU layer never takes the routed epilogue (see Inkling2DecoderLayer).
+            assert combine
+            output = inkling2_experts_xpu.experts_forward(
+                x,
+                weights,
+                ids,
+                self,
+                output_dtype=torch.float32 if self.ep_size > 1 else x.dtype,
+            )
+            if self.ep_size > 1:
+                output = all_reduce(output, get_parallel().moe_ep_group)
+            return output.to(x.dtype)
         if x.shape[0] == 0:
             return x
         if self.native_sm120:
@@ -1222,7 +1240,7 @@ class Inkling2MoE(nn.Module):
 
     def local_input_rows(self, tokens, combine):
         """(start, count) of the MoE-input rows this rank needs, or None for all."""
-        if not combine or get_parallel().moe_tp_size > 1:
+        if get_platform().is_xpu or not combine or get_parallel().moe_tp_size > 1:
             return None
         return self.experts.mega_local_input_rows(tokens)
 
