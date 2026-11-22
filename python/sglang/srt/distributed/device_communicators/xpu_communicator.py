@@ -19,5 +19,9 @@ class XpuCommunicator:
         self.world_size = dist.get_world_size(self.group)
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        # Eager XCCL may start before work already queued on this stream finishes,
+        # which hangs large TP2 prefill reductions; captured graphs order it.
+        if not torch.xpu.is_current_stream_capturing():
+            torch.xpu.current_stream(x.device).synchronize()
         dist.all_reduce(x, group=self.group)
         return x
