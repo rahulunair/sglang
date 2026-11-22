@@ -934,6 +934,26 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._draft_swa_cell_size = self._draft_cell_size
             self._draft_cell_size = 0
 
+        # Inkling MTP receives the target's separate full/SWA capacities.
+        # Its local layers therefore cost bytes per SWA row, not per full row.
+        # Keep unified/fused/ring layouts on their existing accounting policy.
+        draft_config = kvc.spec_aux_config.draft_model_config
+        if (
+            self._draft_cell_size > 0
+            and not self._draft_follows_swa
+            and not self._enable_unified_memory
+            and draft_config is not None
+            and draft_config.hf_config.model_type == "inkling2_mtp"
+        ):
+            draft_hf = draft_config.hf_config
+            draft_layers = int(kvc.spec_aux_config.dflash_draft_num_layers)
+            local_layers = len(draft_hf.local_layer_ids)
+            if self._draft_cell_size % draft_layers:
+                raise ValueError("Inkling MTP draft KV cost must divide by its depth")
+            per_layer = self._draft_cell_size // draft_layers
+            self._draft_cell_size = per_layer * (draft_layers - local_layers)
+            self._draft_swa_cell_size = per_layer * local_layers
+
         self._recompute_cell_size()
 
     def _full_cell_bytes(self) -> int:
