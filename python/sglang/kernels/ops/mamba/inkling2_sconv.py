@@ -311,6 +311,8 @@ def _cuda_sconv(
     """_sconv_kernel in CUDA; False when an operand layout or dtype is unsupported.
     FP32 x only in the routed epilogue, and with top-k rows only under round_bf16
     (the CUDA gather rounds the sum to bf16)."""
+    if x.device.type == "xpu":
+        return False
     rows, d = (attention if attention is not None else x).shape
     ints = (
         metadata["safe_idx"],
@@ -428,7 +430,7 @@ def short_convolution(
     scale = (width * (2 if dynamic else 1) + int(use_residual)) ** -0.5
     output = torch.empty_like(x, memory_format=torch.contiguous_format)
     if x.shape[0]:
-        assert x.is_cuda and x.stride(-1) == 1
+        assert x.device.type in ("cuda", "xpu") and x.stride(-1) == 1
         assert cache.ndim == 3 and cache.shape[1:] == (width - 1, x.shape[1])
         assert (track_mask is None) == (track_indices is None)
         if not decode and window is None and x.shape[0] >= PREFILL_MIN_ROWS:

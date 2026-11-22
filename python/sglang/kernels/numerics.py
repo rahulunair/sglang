@@ -4,6 +4,11 @@
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.srt.utils import is_xpu
+
+# XPU has no PTX inline assembly; its branches use the portable Triton ops.
+_IS_XPU = tl.constexpr(is_xpu())
+
 _FLT_MIN = tl.constexpr(1.1754943508222875e-38)
 
 
@@ -19,6 +24,8 @@ def round_bf16_to_fp32(value):
 @triton.jit
 def mul_rn_f32(x, y):
     """Opaque correctly-rounded fp32 multiply that blocks FMA contraction."""
+    if _IS_XPU:
+        return x * y
     return tl.inline_asm_elementwise(
         asm="mul.rn.f32 $0, $1, $2;",
         constraints="=f,f,f",
@@ -32,6 +39,8 @@ def mul_rn_f32(x, y):
 @triton.jit
 def div_rn_f32(x, y):
     """IEEE correctly-rounded fp32 division."""
+    if _IS_XPU:
+        return tl.div_rn(x, y)
     return tl.inline_asm_elementwise(
         asm="div.rn.f32 $0, $1, $2;",
         constraints="=f,f,f",
@@ -44,6 +53,8 @@ def div_rn_f32(x, y):
 
 @triton.jit
 def rsqrt_approx_f32(x):
+    if _IS_XPU:
+        return tl.rsqrt(x)
     return tl.inline_asm_elementwise(
         asm="rsqrt.approx.f32 $0, $1;",
         constraints="=f,f",
@@ -66,6 +77,8 @@ def cuda_rsqrtf(x):
 @triton.jit
 def silu_approx_f32(x):
     """Match the CUDA fast-math SiLU ``__fdividef(x, 1 + __expf(-x))``."""
+    if _IS_XPU:
+        return x / (1.0 + tl.exp2(-x * 1.4426950408889634))
     # __expf(-x) == ex2.approx(x * -log2(e)); folding the negation into
     # the constant (0fBFB8AA3B == -log2(e)) flips the sign exactly.
     exp_neg = tl.inline_asm_elementwise(

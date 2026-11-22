@@ -10,7 +10,10 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.ops.communication import inkling_all_reduce as ar
+from sglang.srt.utils import is_xpu
 
+# XPU has no NVLink multicast or symmetric memory: reductions use the group.
+_is_xpu = is_xpu()
 _RANK_ORDER_MAX_BYTES = {2: 1200 * 1024, 4: 512 * 1024, 8: 288 * 1024, 16: 64 * 1024}
 
 
@@ -25,6 +28,8 @@ def _rank_sum(X, Y, N: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
 
 
 def _device():
+    if _is_xpu:
+        return torch.device("xpu", torch.xpu.current_device())
     return torch.device("cuda", torch.cuda.current_device())
 
 
@@ -61,6 +66,8 @@ def _multicast_view(group, device, dtype, numel):
 
 
 def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tensor:
+    if x.device.type == "xpu":
+        return x if group.world_size == 1 or x.numel() == 0 else group.all_reduce(x)
     world = group.world_size
     if world == 1 or x.numel() == 0:
         return x
@@ -95,12 +102,14 @@ def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tens
 def multicast_all_reduce_input(group, shape, dtype):
     """A view of the symmetric multicast buffer for a producer to write an all-reduce
     input into; multicast_all_reduce reduces it in place."""
-    if group.world_size == 1:
+    if _is_xpu or group.world_size == 1:
         return torch.empty(shape, dtype=dtype, device=_device())
     return _multicast_view(group, _device(), dtype, shape[0] * shape[1]).view(shape)
 
 
 def multicast_all_reduce(x, group):
+    if x.device.type == "xpu":
+        return x if group.world_size == 1 else group.all_reduce(x)
     if group.world_size == 1:
         return x
     torch.ops.symm_mem.multimem_all_reduce_(
@@ -202,6 +211,8 @@ def oneshot_all_reduce_input(group, rows, cols, dtype, tag=""):
     """A view of the next one-shot all-reduce input region for a producer to write
     into, or None when the one-shot path does not apply (including when NVLink
     multicast is unavailable). FP32 inputs take only the full one-shot sizes."""
+    if _is_xpu:
+        return None
     if (
         group.world_size not in (4, 8)
         or dtype not in (torch.bfloat16, torch.float32)

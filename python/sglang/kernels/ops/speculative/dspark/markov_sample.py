@@ -420,7 +420,9 @@ class MarkovSampleStep:
             value = (torch.tanh(value / softcap) * softcap).to(step_dtype).float()
         if vocab_limit is not None:
             columns = vocab_start + torch.arange(value.shape[1], device=value.device)
-            value[:, columns >= vocab_limit] = float("-inf")
+            # A fixed-shape mask avoids boolean-index compaction, which cannot
+            # be recorded in an XPU graph.
+            value.masked_fill_(columns >= vocab_limit, float("-inf"))
         if gather_logits is not None and logits_out is not None:
             full = gather_logits(value.to(step_dtype))[:, : logits_out.shape[1]]
             return cls.torch(
