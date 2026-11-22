@@ -193,6 +193,7 @@ def _make_model_runner(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        draft_model_config=None,
     )
     # Fused draft KV is off unless a test opts in (a bare MagicMock return
     # would read as a truthy entry size and take the fused pricing branch).
@@ -1466,6 +1467,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
             mr.spec_aux_config = SimpleNamespace(
                 eagle_draft_num_layers=None,
                 dflash_draft_num_layers=5,
+                draft_model_config=None,
             )
             mr.dflash_draft_cell_size_per_token = draft_kv_per_token
             mr.dflash_draft_loc_space_scale = loc_space_scale
@@ -1494,6 +1496,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
         mr.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=None,
             dflash_draft_num_layers=5,
+            draft_model_config=None,
         )
         mr.dflash_draft_cell_size_per_token = 10_240
         with (
@@ -1690,6 +1693,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
             mr.spec_aux_config = SimpleNamespace(
                 eagle_draft_num_layers=None,
                 dflash_draft_num_layers=5,
+                draft_model_config=None,
             )
             with mock_cpu_env():
                 from sglang.srt.model_executor.pool_configurator import (
@@ -1701,6 +1705,59 @@ class TestDflashDraftKvBudget(CustomTestCase):
             return config.full_max_total_num_tokens
 
         self.assertLess(_tokens(10240), _tokens(None))
+
+
+class TestInklingMTPHybridBudget(CustomTestCase):
+    """Price the actual one-global/two-window draft pools, not three full pools."""
+
+    def test_inkling_mtp_budget_matches_shared_full_and_swa_capacities(self):
+        for ratio, radix_disabled in [(0.005, False), (0.15, False), (0.005, True)]:
+            with self.subTest(ratio=ratio, radix_disabled=radix_disabled):
+                mr = _make_model_runner(
+                    self,
+                    num_kv_heads=4,
+                    head_dim=128,
+                    v_head_dim=128,
+                    num_layers=48,
+                    is_hybrid_swa=True,
+                    full_attention_layer_ids=list(range(8)),
+                    swa_attention_layer_ids=list(range(8, 48)),
+                    swa_full_tokens_ratio=ratio,
+                    page_size=64,
+                    disable_radix_cache=radix_disabled,
+                    chunked_prefill_size=256,
+                    sliding_window_size=1023,
+                    max_running_requests=4,
+                )
+                mr.spec_algorithm.is_dflash_family.return_value = True
+                mr.dflash_draft_cell_size_per_token = 3 * 2048
+                mr.spec_aux_config = SimpleNamespace(
+                    eagle_draft_num_layers=None,
+                    dflash_draft_num_layers=3,
+                    draft_model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(
+                            model_type="inkling2_mtp",
+                            local_layer_ids=[0, 2],
+                        )
+                    ),
+                )
+                available = 20 * (1 << 30)
+                with mock_cpu_env(tp_size=2):
+                    from sglang.srt.model_executor.pool_configurator import (
+                        create_memory_pool_configurator,
+                    )
+
+                    cfg = create_memory_pool_configurator(mr)
+                    config = cfg.calculate_pool_sizes(available, 64)
+                full = config.full_max_total_num_tokens
+                swa = config.swa_max_total_num_tokens
+                actual = full * (8 + 1) * 2048 + swa * (40 + 2) * 2048
+                self.assertLessEqual(actual, available)
+                self.assertLess(available - actual, 64 * (9 + 42) * 2048)
+                if ratio == 0.005:
+                    self.assertGreaterEqual(full, 1048576)
+                self.assertEqual(cfg._draft_cell_size, 2048)
+                self.assertEqual(cfg._draft_swa_cell_size, 4096)
 
 
 class TestSWAPoolFloor(CustomTestCase):
@@ -1924,7 +1981,7 @@ class TestSWAPoolFloor(CustomTestCase):
             page_size=256,
             spec_algorithm=spec,
             spec_aux_config=SimpleNamespace(
-                dflash_draft_num_layers=40, dspark_num_stages=3
+                dflash_draft_num_layers=40, dspark_num_stages=3, draft_model_config=None
             ),
         )
         with patch(
