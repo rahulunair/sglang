@@ -145,12 +145,27 @@ def _nv_candidate(z, group_max, enc, dec, amax_scale, den: tl.constexpr):
 
 
 @triton.jit
-def _nv_quant_kernel(X, Q, A, GROUPS: tl.constexpr, GROUPS_POW2: tl.constexpr):
+def _store_rows(
+    Q, Perm, row, inner, value, mask, WIDTH: tl.constexpr, TOP_K: tl.constexpr
+):
+    """Store one quantized row at row, or at each of its TOP_K sorted positions."""
+    if TOP_K == 0:
+        tl.store(Q + row * WIDTH + inner, value, mask)
+    else:
+        for k in tl.static_range(TOP_K):
+            dst = tl.load(Perm + row * TOP_K + k).to(tl.int64)
+            tl.store(Q + dst * WIDTH + inner, value, mask)
+
+
+@triton.jit
+def _nv_quant_kernel(
+    X, Q, A, Perm, GROUPS: tl.constexpr, GROUPS_POW2: tl.constexpr, TOP_K: tl.constexpr
+):
     row = tl.program_id(0).to(tl.int64)
     group = tl.arange(0, GROUPS_POW2)
     mask = (group < GROUPS)[:, None]
-    offsets = row * GROUPS * 16 + group[:, None] * 16 + tl.arange(0, 16)[None, :]
-    z = tl.load(X + offsets, mask, other=0.0).to(tl.float32)
+    inner = group[:, None] * 16 + tl.arange(0, 16)[None, :]
+    z = tl.load(X + row * GROUPS * 16 + inner, mask, other=0.0).to(tl.float32)
     group_max = tl.max(tl.abs(z), 1)
     a = tl.max(group_max, 0)
     enc = tl.minimum(tl.div_rn(1.0, a) * 1536.0, 3.4028234663852886e38)
@@ -158,19 +173,20 @@ def _nv_quant_kernel(X, Q, A, GROUPS: tl.constexpr, GROUPS_POW2: tl.constexpr):
     amax_scale = a * (1.0 / 1536.0)
     v6, err6 = _nv_candidate(z, group_max, enc, dec, amax_scale, 6.0)
     v4, err4 = _nv_candidate(z, group_max, enc, dec, amax_scale, 4.0)
-    tl.store(
-        Q + offsets, tl.where((err4 < err6)[:, None], v4, v6).to(tl.bfloat16), mask
-    )
+    value = tl.where((err4 < err6)[:, None], v4, v6).to(tl.bfloat16)
+    _store_rows(Q, Perm, row, inner, value, mask, GROUPS * 16, TOP_K)
     tl.store(A + row, a)
 
 
 @triton.jit
-def _mx_quant_kernel(X, Q, BLOCKS: tl.constexpr, BLOCKS_POW2: tl.constexpr):
+def _mx_quant_kernel(
+    X, Q, Perm, BLOCKS: tl.constexpr, BLOCKS_POW2: tl.constexpr, TOP_K: tl.constexpr
+):
     row = tl.program_id(0).to(tl.int64)
     block = tl.arange(0, BLOCKS_POW2)
     mask = (block < BLOCKS)[:, None]
-    offsets = row * BLOCKS * 32 + block[:, None] * 32 + tl.arange(0, 32)[None, :]
-    x = tl.load(X + offsets, mask, other=0.0).to(tl.float32)
+    inner = block[:, None] * 32 + tl.arange(0, 32)[None, :]
+    x = tl.load(X + row * BLOCKS * 32 + inner, mask, other=0.0).to(tl.float32)
     raw = tl.max(tl.abs(x), 1) * (1.0 / 448.0)
     p = ((raw.to(tl.int32, bitcast=True) + 0x007FFFFF) & 0x7F800000) >> 23
     p = tl.where(raw <= 5.877471754111438e-39, 0, tl.minimum(p, 254))
@@ -183,44 +199,53 @@ def _mx_quant_kernel(X, Q, BLOCKS: tl.constexpr, BLOCKS_POW2: tl.constexpr):
     magnitude = _e4m3_rne(tl.abs(scaled))
     value = tl.where(scaled < 0, -magnitude, magnitude)
     out = tl.where(tiny, value * 5.877471754111438e-39, value * scale[:, None])
-    tl.store(Q + offsets, out.to(tl.bfloat16), mask)
+    _store_rows(Q, Perm, row, inner, out.to(tl.bfloat16), mask, BLOCKS * 32, TOP_K)
 
 
-def quantize_nv(x):
+def quantize_nv(x, perm=None, top_k=0):
     """NVFP4 activation fake quantization of [rows, width] (width % 16 == 0).
 
     Returns the dequantized BF16 values and the FP32 per-row amax. Each K16 group
     takes the E4M3 scale of its 6- or 4-level candidate with the lower error.
+    With perm ([rows * top_k] destination rows), row r is written to rows
+    perm[r * top_k + k] of a [rows * top_k, width] output instead.
     """
     rows, width = x.shape
     assert width % 16 == 0 and x.is_contiguous()
-    q = torch.empty((rows, width), device=x.device, dtype=torch.bfloat16)
+    out_rows = rows * top_k if perm is not None else rows
+    q = torch.empty((out_rows, width), device=x.device, dtype=torch.bfloat16)
     amax = torch.empty(rows, device=x.device, dtype=torch.float32)
     if rows:
         _nv_quant_kernel[(rows,)](
             x,
             q,
             amax,
+            perm if perm is not None else amax,
             width // 16,
             triton.next_power_of_2(width // 16),
+            top_k if perm is not None else 0,
             num_warps=4,
             enable_fp_fusion=False,
         )
     return q, amax
 
 
-def quantize_mx(x):
+def quantize_mx(x, perm=None, top_k=0):
     """MXFP8 activation fake quantization of [rows, width] (width % 32 == 0):
-    E4M3 values with one UE8M0 scale per K32 block, dequantized to BF16."""
+    E4M3 values with one UE8M0 scale per K32 block, dequantized to BF16.
+    perm and top_k scatter rows as in quantize_nv."""
     rows, width = x.shape
     assert width % 32 == 0 and x.is_contiguous()
-    q = torch.empty((rows, width), device=x.device, dtype=torch.bfloat16)
+    out_rows = rows * top_k if perm is not None else rows
+    q = torch.empty((out_rows, width), device=x.device, dtype=torch.bfloat16)
     if rows:
         _mx_quant_kernel[(rows,)](
             x,
             q,
+            perm if perm is not None else q,
             width // 32,
             triton.next_power_of_2(width // 32),
+            top_k if perm is not None else 0,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -288,6 +313,119 @@ def _sorted_route_meta(
     tl.store(Gamma + dst, tl.where(expert < local, weight, 0.0), mask)
 
 
+# Decode, verify and small prefill batches sort their routes in one program; above
+# this the native prepare_moe_input path runs. Arbitrary bound on the in-register
+# sort (8 requests x 9 verify tokens x top-8 is 576).
+SORT_MAX_ROUTES = 1024
+
+
+@triton.jit
+def _route_sort(
+    Ids,
+    Weights,
+    Perm,
+    Counts,
+    TokenOf,
+    ExpertOf,
+    Gamma,
+    rows,
+    start,
+    local,
+    TOP_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    EXPERTS_POW2: tl.constexpr,
+):
+    """Sort routes by rank-local expert (other ranks' routes last, as skip expert
+    local), stable in route order. Writes each route's sorted row (Perm), the
+    per-expert row counts, and each sorted row's token, expert and gamma."""
+    r = tl.arange(0, BLOCK)
+    valid = r < rows
+    expert = tl.load(Ids + r, valid, other=0).to(tl.int32) - start
+    expert = tl.where((expert >= 0) & (expert < local), expert, local)
+    key = tl.sort(tl.where(valid, expert * BLOCK + r, 2147483647))
+    ok = r < rows
+    src = tl.where(ok, key % BLOCK, 0)
+    sorted_expert = tl.where(ok, key // BLOCK, local)
+    tl.store(Perm + src, r, ok)
+    tl.store(TokenOf + r, src // TOP_K, ok)
+    tl.store(ExpertOf + r, sorted_expert, ok)
+    weight = tl.load(Weights + src, ok, other=0.0).to(tl.float32)
+    tl.store(Gamma + r, tl.where(sorted_expert < local, weight, 0.0), ok)
+    bins = tl.arange(0, EXPERTS_POW2)
+    counts = tl.sum((sorted_expert[None, :] == bins[:, None]).to(tl.int32), 1)
+    tl.store(Counts + bins, counts, bins < local)
+
+
+def _sort_routes_native(flat, weights, rows, start, local, hidden, top, dev):
+    """prepare_moe_input path for large route counts; same outputs as _route_sort."""
+    import sgl_kernel.moe  # noqa: F401  registers the Xe20 MoE ops
+
+    sort_ids = torch.empty(rows, dtype=torch.int32, device=dev)
+    _local_expert_ids[(triton.cdiv(rows, 1024),)](
+        flat, sort_ids, rows, start, local, 1024
+    )
+    counts = torch.empty(local + 1, dtype=torch.int32, device=dev)
+    sizes1 = torch.empty((local + 1, 3), dtype=torch.int32, device=dev)
+    sizes2 = torch.empty((local + 1, 3), dtype=torch.int32, device=dev)
+    a_map = torch.empty(rows, dtype=torch.int32, device=dev)
+    perm = torch.empty(rows, dtype=torch.int32, device=dev)
+    torch.ops.sgl_kernel.prepare_moe_input.default(
+        sort_ids.view(-1, top),
+        counts,
+        None,
+        sizes1,
+        sizes2,
+        a_map,
+        perm,
+        local + 1,
+        hidden,
+        top,
+    )
+    token_of = torch.empty(rows, dtype=torch.int32, device=dev)
+    expert_of = torch.empty(rows, dtype=torch.int32, device=dev)
+    gamma = torch.empty(rows, dtype=torch.float32, device=dev)
+    _sorted_route_meta[(triton.cdiv(rows, 1024),)](
+        perm, sort_ids, weights, token_of, expert_of, gamma, rows, local, top, 1024
+    )
+    return perm, counts[:local], token_of, expert_of, gamma
+
+
+def sort_routes(ids, weights, start, local, hidden, *, force_native=False):
+    """Route sorting metadata for experts_forward: (perm, counts, token_of,
+    expert_of, gamma). perm[r] is route r's sorted row; counts covers this rank's
+    experts; sorted rows past their sum belong to other ranks."""
+    flat = ids.reshape(-1)
+    rows, top, dev = flat.numel(), ids.shape[1], ids.device
+    flat_weights = weights.reshape(-1)
+    if force_native or rows > SORT_MAX_ROUTES:
+        return _sort_routes_native(
+            flat, flat_weights, rows, start, local, hidden, top, dev
+        )
+    perm = torch.empty(rows, dtype=torch.int32, device=dev)
+    counts = torch.empty(local, dtype=torch.int32, device=dev)
+    token_of = torch.empty(rows, dtype=torch.int32, device=dev)
+    expert_of = torch.empty(rows, dtype=torch.int32, device=dev)
+    gamma = torch.empty(rows, dtype=torch.float32, device=dev)
+    block = max(16, triton.next_power_of_2(rows))
+    _route_sort[(1,)](
+        flat,
+        flat_weights,
+        perm,
+        counts,
+        token_of,
+        expert_of,
+        gamma,
+        rows,
+        start,
+        local,
+        top,
+        block,
+        triton.next_power_of_2(local),
+        num_warps=8,
+    )
+    return perm, counts, token_of, expert_of, gamma
+
+
 def experts_forward(x, weights, ids, m, *, output_dtype=None):
     """Routed experts of one Inkling layer on sgl-kernel-xpu Xe20 grouped GEMMs.
 
@@ -313,41 +451,17 @@ def experts_forward(x, weights, ids, m, *, output_dtype=None):
     flat = ids.reshape(-1)
     rows = flat.numel()
     dev = x.device
-    sort_ids = torch.empty((tokens, top), dtype=torch.int32, device=dev)
-    _local_expert_ids[(triton.cdiv(rows, 1024),)](
-        flat, sort_ids, rows, start, local, 1024
+    perm, local_counts, token_of, expert_of, gamma = sort_routes(
+        ids, weights, start, local, hidden
     )
-    counts = torch.empty(local + 1, dtype=torch.int32, device=dev)
-    sizes1 = torch.empty((local + 1, 3), dtype=torch.int32, device=dev)
-    sizes2 = torch.empty((local + 1, 3), dtype=torch.int32, device=dev)
-    a_map = torch.empty(rows, dtype=torch.int32, device=dev)
-    perm = torch.empty(rows, dtype=torch.int32, device=dev)
-    torch.ops.sgl_kernel.prepare_moe_input.default(
-        sort_ids, counts, None, sizes1, sizes2, a_map, perm, local + 1, hidden, top
-    )
-
-    q, xa = quantize_nv(x.contiguous()) if fp4 else (quantize_mx(x.contiguous()), None)
-    q_sorted = torch.empty((rows, hidden), dtype=torch.bfloat16, device=dev)
-    torch.ops.sgl_kernel.scatter_tokens_to_experts.default(q, perm, q_sorted)
-
-    token_of = torch.empty(rows, dtype=torch.int32, device=dev)
-    expert_of = torch.empty(rows, dtype=torch.int32, device=dev)
-    gamma = torch.empty(rows, dtype=torch.float32, device=dev)
-    _sorted_route_meta[(triton.cdiv(rows, 1024),)](
-        perm,
-        sort_ids,
-        weights.reshape(-1),
-        token_of,
-        expert_of,
-        gamma,
-        rows,
-        local,
-        top,
-        1024,
-    )
+    # Quantize each token once and write it to its top_k sorted rows.
+    x = x.contiguous()
+    if fp4:
+        q_sorted, xa = quantize_nv(x, perm, top)
+    else:
+        q_sorted, xa = quantize_mx(x, perm, top), None
 
     gate_up = torch.empty((rows, 2 * f), dtype=torch.bfloat16, device=dev)
-    local_counts = counts[:local]
     _xe20_gemm(gate_up, q_sorted, m.w13_weight, m.w13_scale, local_counts, local, fp4)
     hidden_act = torch.empty((rows, f), dtype=torch.bfloat16, device=dev)
     _restore_situ_rows[(rows, triton.cdiv(f, 256))](

@@ -14,11 +14,13 @@ import torch
 import triton
 
 from sglang.kernels.ops.moe import inkling2_route
+from sglang.kernels.ops.moe import inkling2_experts_xpu
 from sglang.kernels.ops.moe.inkling2_experts_xpu import (
     check_native_experts,
     experts_forward,
     quantize_mx,
     quantize_nv,
+    sort_routes,
 )
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.kernels import inkling2_xpu as ref
@@ -221,3 +223,40 @@ def test_route_topk_argmax_matches_key_sort(rows, groups, ties, with_bias):
     got_ids, got_w = route(partials, bias, True)
     assert torch.equal(got_ids, want_ids)
     assert torch.equal(got_w, want_w)
+
+
+@pytest.mark.parametrize("tokens,top", [(1, 8), (9, 8), (72, 8), (37, 4)])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_route_sort_matches_native_prepare(tokens, top, rank):
+    torch.manual_seed(tokens * 10 + rank)
+    experts, local = 128, 64
+    ids = (
+        torch.stack([torch.randperm(experts)[:top] for _ in range(tokens)]).int().xpu()
+    )
+    weights = torch.rand(tokens, top).xpu()
+    small = sort_routes(ids, weights, rank * local, local, 2304)
+    native = sort_routes(ids, weights, rank * local, local, 2304, force_native=True)
+    # Same expert blocks and the same per-route metadata; the order of rows inside
+    # an expert may differ, which the per-row GEMMs and the combine do not see.
+    perm_small, perm_native = small[0].long(), native[0].long()
+    assert torch.equal(small[1], native[1])
+    assert torch.equal(small[3], native[3])
+    for column in (2, 3, 4):
+        assert torch.equal(small[column][perm_small], native[column][perm_native])
+    assert torch.equal(
+        torch.sort(perm_small)[0], torch.arange(perm_small.numel(), device="xpu")
+    )
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize("ep_rank", [None, 1])
+def test_fused_route_path_is_bitwise_identical(fp4, ep_rank, monkeypatch):
+    if not supported(fp4):
+        pytest.skip("installed sgl-kernel-xpu lacks this format")
+    m = fixture(fp4, experts=16)
+    x, w, ids = (t.xpu() for t in inputs(9, 16, 256))
+    d = to_device(m) if ep_rank is None else to_device(m, ep_rank, 2)
+    fused = experts_forward(x, w, ids, d, output_dtype=torch.float32)
+    monkeypatch.setattr(inkling2_experts_xpu, "SORT_MAX_ROUTES", 0)
+    native = experts_forward(x, w, ids, d, output_dtype=torch.float32)
+    assert torch.equal(fused, native)
