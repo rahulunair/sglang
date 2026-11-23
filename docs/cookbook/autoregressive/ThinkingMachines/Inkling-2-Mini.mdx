@@ -129,13 +129,13 @@ sglang serve --model-path thinkingmachines/Inkling-2-Mini \
   --hybrid-cache-checkpoints-level 2 --max-mamba-cache-size 64 \
   --speculative-algorithm DSPARK --speculative-num-draft-tokens 8 \
   --speculative-draft-attention-backend inkling2_xpu \
-  --cuda-graph-config '{"decode":{"backend":"full","bs":[1,2,4,8],"max_bs":8},"prefill":{"backend":"disabled"}}' \
+  --cuda-graph-config '{"decode":{"backend":"full","bs":[1,2,4,8],"max_bs":8},"prefill":{"backend":"full","bs":[64,128,256,512,1024,2048,4096,8192],"max_bs":8192,"full_prefill_max_req":4,"max_seq_len":8192}}' \
   --enable-multimodal --reasoning-parser inkling --tool-call-parser inkling2 \
   --grammar-backend xgrammar --enable-cache-report --watchdog-timeout 1200
 ```
 
 For four cards, set `ZE_AFFINITY_MASK=0,1,2,3`, `--tp 4 --ep 4`, `--context-length 1048576` and `--max-total-tokens 1052672`.
 
-**Notes.** Run the server process with a high open-file limit (`ulimit -n 1048576`, or `--ulimit nofile=1048576:1048576` in Docker): oneCCL passes device-memory handles as file descriptors. A long prefill can occasionally pause for minutes inside oneCCL's handle exchange and then continue, which the longer watchdog absorbs. Prefix caching keeps cached prompts' sliding-window KV resident, so the window pool is sized at `--swa-full-tokens-ratio 0.03`; with the smaller default, long prompts are split into short chunks. The `SGLANG_*` switches are the DSpark runtime folds the CUDA recipes use, with the commit and accept folded into the verify graph.
+**Notes.** Run the server process with a high open-file limit (`ulimit -n 1048576`, or `--ulimit nofile=1048576:1048576` in Docker): oneCCL passes device-memory handles as file descriptors. A long prefill can occasionally pause for minutes inside oneCCL's handle exchange and then continue, which the longer watchdog absorbs. Prefix caching keeps cached prompts' sliding-window KV resident, so the window pool is sized at `--swa-full-tokens-ratio 0.03`; with the smaller default, long prompts are split into short chunks. The `SGLANG_*` switches are the DSpark runtime folds the CUDA recipes use, with the commit and accept folded into the verify graph. Prefill batches of up to 8,192 tokens and 4 requests replay captured graphs (about 0.4 GB per GPU); longer sequences run eagerly.
 
 Both shapes were verified with a teacher-forced logprob accuracy gate, chat, reasoning, tool calling, two image-input checks and prefix-cache reuse (TP2 / 512K and TP4 / 1M); the DSpark runtime switches were verified at both shapes. Not yet run on XPU: the **Balanced** recipe, the **Loop Passes** and **Loop KV Cache** options, PD disaggregation, and HiCache.
