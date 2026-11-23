@@ -5,14 +5,31 @@ from sglang.kernels.ops.attention.inkling2_relative_attention_xpu import (
 )
 from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.runtime_context import get_exec
 
-# Split-K for decode/verify, measured on B70 verify shapes (24/8 heads, 9 rows):
-# a 1023-key window and 64K-128K global contexts.
-DECODE_SPLITS_WINDOW = 16
-DECODE_SPLITS_GLOBAL = 32
+# Split-K programs per decode/verify call (requests x KV heads x splits), measured on
+# B70 at 1, 2, 4 and 8 requests with 2, 4 and 8 KV heads per rank, 1.5K-128K contexts.
+DECODE_PROGRAMS_WINDOW = 128
+DECODE_PROGRAMS_GLOBAL = 256
+DECODE_MAX_SPLITS = 128
+
+
+def _decode_splits(
+    *, requests: int, kv_heads: int, is_swa: bool, batch_invariant: bool
+) -> int:
+    # Batch-invariant mode sizes for one request: the split count sets the LSE merge
+    # order, so it must not depend on the other requests in the batch.
+    programs = DECODE_PROGRAMS_WINDOW if is_swa else DECODE_PROGRAMS_GLOBAL
+    rows = kv_heads if batch_invariant else requests * kv_heads
+    splits = max(1, programs // max(1, rows))
+    return min(DECODE_MAX_SPLITS, 1 << (splits.bit_length() - 1))
 
 
 class Inkling2XPUAttentionBackend(XPUAttentionBackend):
+    def __init__(self, model_runner, **kwargs):
+        super().__init__(model_runner, **kwargs)
+        self.batch_invariant = get_exec().deterministic.enable_deterministic_inference
+
     def _forward_relative(
         self,
         q,
@@ -57,7 +74,12 @@ class Inkling2XPUAttentionBackend(XPUAttentionBackend):
         query = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         mode = forward_batch.forward_mode
         splits = (
-            (DECODE_SPLITS_WINDOW if is_swa else DECODE_SPLITS_GLOBAL)
+            _decode_splits(
+                requests=forward_batch.batch_size,
+                kv_heads=layer.tp_k_head_num,
+                is_swa=is_swa,
+                batch_invariant=self.batch_invariant,
+            )
             if mode.is_decode() or mode.is_target_verify()
             else 1
         )
