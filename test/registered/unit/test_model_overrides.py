@@ -3689,6 +3689,20 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         )
 
+        # XPU keeps the extra buffer for Inkling-2 only
+        with override_platform(is_xpu=True):
+            for arch, supported in (
+                ("Inkling2ForConditionalGeneration", True),
+                ("Qwen3NextForCausalLM", False),
+            ):
+                self.assertEqual(
+                    supports_mamba_cache_extra_buffer(
+                        SimpleNamespace(linear_attn_backend="triton"),
+                        SimpleNamespace(architectures=[arch]),
+                    ),
+                    supported,
+                )
+
     def test_mamba_radix_cache_resolution_reads_registry_specs(self):
         """A spec registered by config predicate (archs=[]) drives the leaves
         exactly like an arch-registered one, and the spec's
