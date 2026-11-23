@@ -488,7 +488,10 @@ def fused_extend_sconv_metadata(
     cuda-graph-static) destinations instead of fresh allocations.
     """
     is_verify = his_mode == HIS_ONES
-    if (not is_verify and B > _FUSED_EXTEND_MAX_B) or not cache_indices.is_cuda:
+    if (not is_verify and B > _FUSED_EXTEND_MAX_B) or cache_indices.device.type not in (
+        "cuda",
+        "xpu",
+    ):
         return None
     assert cache_indices.shape[0] >= B and cache_indices.stride(0) == 1
     if is_verify:
