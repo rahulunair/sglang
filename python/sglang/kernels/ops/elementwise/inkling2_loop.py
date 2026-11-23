@@ -152,7 +152,8 @@ def _controller_mix(
 
 @functools.cache
 def _sm_count(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
+    props = triton.runtime.driver.active.utils.get_device_properties(device_index)
+    return props["multiprocessor_count"]
 
 
 @functools.cache
@@ -215,12 +216,18 @@ def message_controllers(dests, messages, down, gain, forget, eps=1e-6):
         enable_fp_fusion=False,
         **launch,
     )
-    groups = triton.cdiv(k, 1024)
     decode = tokens <= 16
     split = tokens <= 4096
-    block_m = 16 if decode else 64
-    block_n = 16 if decode else 64
-    block_k = 256 if tokens <= 1024 else 64
+    # Measured on B70 decode (9 tokens, 3 controllers): narrower mix tiles and
+    # fewer warps avoid register spills; a 32-wide down tile halves its launches.
+    xpu_decode = decode and dest.device.type == "xpu"
+    # Measured on B70 prefill (2K and 8K tokens): taller down tiles with 8 warps,
+    # and 32x32 mix tiles over a quarter row each, are about 2x faster without spills.
+    xpu_prefill = not decode and dest.device.type == "xpu"
+    groups = triton.cdiv(k, 1024)
+    block_m = 16 if decode else (128 if xpu_prefill else 64)
+    block_n = (32 if xpu_decode else 16) if decode else 64
+    block_k = 64 if xpu_prefill or tokens > 1024 else 256
     # 64 x 64 tiles with 256-wide K stages need 128 KB of shared memory; SM120 has 99 KB.
     if not decode and block_k == 256 and _max_shared_mem(dest.device.index) < 1 << 17:
         block_k = 128
@@ -242,18 +249,24 @@ def message_controllers(dests, messages, down, gain, forget, eps=1e-6):
         block_n,
         block_k,
         pdl,
-        num_warps=4,
-        num_stages=3,
+        num_warps=8 if xpu_prefill else 4,
+        num_stages=2 if xpu_prefill else 3,
         enable_fp_fusion=False,
         **launch,
     )
-    mix_m, mix_n = (16, 64) if decode else (32, 64)
+    if decode:
+        mix_m, mix_n = (16, 16) if xpu_decode else (16, 64)
+    else:
+        mix_m, mix_n = (32, 32) if xpu_prefill else (32, 64)
     row_blocks, col_tiles = triton.cdiv(tokens, mix_m), triton.cdiv(width, mix_n)
-    tiles_per_program = (
-        1
-        if decode
-        else max(1, col_tiles * row_blocks * num // (12 * _sm_count(dest.device.index)))
-    )
+    if decode:
+        tiles_per_program = 1
+    elif xpu_prefill:
+        tiles_per_program = triton.cdiv(col_tiles, 4)
+    else:
+        tiles_per_program = max(
+            1, col_tiles * row_blocks * num // (12 * _sm_count(dest.device.index))
+        )
     _controller_mix[(row_blocks, num, triton.cdiv(col_tiles, tiles_per_program))](
         partials,
         gain,
@@ -271,9 +284,9 @@ def message_controllers(dests, messages, down, gain, forget, eps=1e-6):
         mix_m,
         mix_n,
         tiles_per_program * mix_n,
-        1 if decode else 3,
+        1 if decode or xpu_prefill else 3,
         pdl,
-        num_warps=4 if decode else 8,
+        num_warps=(2 if xpu_decode else 4) if decode else (4 if xpu_prefill else 8),
         enable_fp_fusion=False,
         **launch,
     )

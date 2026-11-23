@@ -69,3 +69,42 @@ def attn_res_reference(blocks, partial_addend, queries, *, normalize_values=Fals
         probs = probs * rstd.unsqueeze(0)
     result = torch.einsum("qst,std->qtd", probs, values)
     return tuple(result.unbind(0))
+
+
+def residual_add_reference(*inputs):
+    value = inputs[0].float()
+    for item in inputs[1:]:
+        value = value + item.float()
+    return value.to(inputs[0].dtype)
+
+
+def message_controllers_reference(dests, messages, down, gain, forget, eps=1e-6):
+    assert len(dests) == len(messages) == down.shape[0]
+    outputs = []
+    for i, (dest, message) in enumerate(zip(dests, messages)):
+        dest, message = dest.float(), message.float()
+        pair = torch.cat(
+            (
+                rms_norm_reference(dest, None, eps),
+                rms_norm_reference(message, None, eps),
+            ),
+            dim=-1,
+        ).to(torch.bfloat16)
+        # Source sums K1024 FP32 partials in order before the BF16 cast.
+        hidden = None
+        for start in range(0, pair.shape[-1], 1024):
+            part = (
+                pair[..., start : start + 1024].float()
+                @ down[i, :, start : start + 1024].float().T
+            )
+            hidden = part if hidden is None else hidden + part
+        hidden = hidden.to(torch.bfloat16).float()
+        gain_value = hidden @ gain[i].float().T
+        forget_value = hidden @ forget[i].float().T
+        outputs.append(
+            (1.0 - torch.tanh(forget_value)) * dest + torch.tanh(gain_value) * message
+        )
+    return torch.stack(outputs)
+
+
+# One program per row keeps decode and verify rows on the same reduction tree.
