@@ -107,6 +107,7 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_hip,
     is_npu,
+    is_xpu,
 )
 from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.log_utils import log_info_on_rank0
@@ -440,11 +441,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             dsv41_static or self._static_epilogue_needs_draft_fold
         )
         # ROCm (V4.1 target only): inside a HIP graph the accept-site TP broadcasts
-        # need the group's pynccl communicator
+        # need the group's pynccl communicator. XPU graphs capture xccl collectives.
         if (
             (self._verify_planner.is_compact_mode or static_epilogue_supported)
             and self._decode_graph_allowed
-            and (is_cuda() or _is_npu or (is_cuda_alike() and target_is_dsv41))
+            and (
+                is_cuda()
+                or _is_npu
+                or is_xpu()
+                or (is_cuda_alike() and target_is_dsv41)
+            )
         ):
             max_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
             self._deferred_draft_kv = maybe_build_deferred_draft_kv(

@@ -751,9 +751,7 @@ class DsparkVerifyEpilogue:
             out_cache_loc=forward_batch.out_cache_loc,
             positions=forward_batch.positions,
         )
-        capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
+        capturing = torch.get_device_module().is_current_stream_capturing()
         if capturing:
             self.static_io[bs] = io
         committed_engram = self.run_static(
@@ -914,8 +912,7 @@ class DsparkVerifyEpilogue:
         """Once per captured batch size, from the branch that launches the kernel."""
         if (
             bs in self._accept_tail_logged
-            or not torch.cuda.is_available()
-            or not torch.cuda.is_current_stream_capturing()
+            or not torch.get_device_module().is_current_stream_capturing()
         ):
             return
         self._accept_tail_logged.add(bs)
@@ -949,9 +946,9 @@ class DsparkVerifyEpilogue:
         if self.commit_ctx is None:
             return
         if self.future_relay is None:
-            assert not (
-                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-            ), "the future relay is built at a warmup, before capture"
+            assert not (torch.get_device_module().is_current_stream_capturing()), (
+                "the future relay is built at a warmup, before capture"
+            )
             self.future_relay = FutureRelayBuffers(
                 req_pool_size=self.commit_ctx.resolve_req_to_token().shape[0],
                 device=req_pool_indices.device,
