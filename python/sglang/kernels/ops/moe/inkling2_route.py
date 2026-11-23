@@ -5,8 +5,13 @@ from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe.gate_topk import fpval_to_key, key_to_indx
+from sglang.srt.utils import is_xpu
 
 PDL = is_arch_support_pdl()
+_is_xpu = is_xpu()
+_IS_XPU = tl.constexpr(_is_xpu)
+# The XPU Triton launcher takes no launch_pdl option.
+_LAUNCH = {} if _is_xpu else {"launch_pdl": PDL}
 
 ROUTE_MAX_ROWS = 512
 ROUTE_MAX_IDS = 4096
@@ -32,9 +37,11 @@ def _route_topk(
     TOPK_POW2: tl.constexpr,
     BLOCK_N: tl.constexpr,
     RENORM: tl.constexpr,
+    TOPK_BY_ARGMAX: tl.constexpr = _IS_XPU,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if not _IS_XPU:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
     mask = cols < N
@@ -46,15 +53,27 @@ def _route_topk(
     if HAS_BIAS:
         selection = selection + tl.load(Bias + cols, mask, other=0)
     selection = tl.where(mask, selection, float("-inf"))
-    keys = fpval_to_key(selection.to(tl.uint32, bitcast=True)).to(tl.uint64) << 16
-    keys = keys | (BLOCK_N - cols).to(tl.uint64)
-    top = tl.sort(
-        tl.topk(tl.reshape(keys, (1, BLOCK_N)), TOPK_POW2, dim=1),
-        dim=1,
-        descending=True,
-    )
     slots = tl.arange(0, TOPK_POW2)
-    ids = key_to_indx((tl.reshape(top, (TOPK_POW2,)) & 0xFFFF).to(tl.int32), BLOCK_N)
+    if TOPK_BY_ARGMAX:
+        # Same order as the key sort (value descending, ties to the lower id)
+        # without 64-bit sort networks, which Xe emulates.
+        ids = tl.zeros((TOPK_POW2,), tl.int32)
+        for k in tl.static_range(TOPK):
+            best = tl.max(selection, 0)
+            pick = tl.min(tl.where(selection == best, cols, BLOCK_N), 0)
+            ids = tl.where(slots == k, pick, ids)
+            selection = tl.where(cols == pick, float("-inf"), selection)
+    else:
+        keys = fpval_to_key(selection.to(tl.uint32, bitcast=True)).to(tl.uint64) << 16
+        keys = keys | (BLOCK_N - cols).to(tl.uint64)
+        top = tl.sort(
+            tl.topk(tl.reshape(keys, (1, BLOCK_N)), TOPK_POW2, dim=1),
+            dim=1,
+            descending=True,
+        )
+        ids = key_to_indx(
+            (tl.reshape(top, (TOPK_POW2,)) & 0xFFFF).to(tl.int32), BLOCK_N
+        )
     tl.store(Ids + row * TOPK + slots, ids, slots < TOPK)
     if RENORM:
         tl.debug_barrier()
@@ -120,7 +139,7 @@ def route_topk(partials, bias, topk, route_scale=None, global_scale=None):
             triton.next_power_of_2(n),
             fuse_renorm,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **_LAUNCH,
         )
     if fuse_renorm:
         return logits, ids, weights
@@ -150,8 +169,9 @@ def _route_metadata(
     SEARCH_N: tl.constexpr,
     SEARCH_E: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if not _IS_XPU:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offs = tl.arange(0, BLOCK_N)
     mask = offs < n
     ids = tl.load(Ids + offs, mask, other=65535)
@@ -270,7 +290,7 @@ def route_metadata(ids, weights, start, num_local, num_experts, block_size_m=128
             block_n.bit_length(),
             block_e.bit_length(),
             num_warps=min(32, max(4, block_n // 128)),
-            launch_pdl=PDL,
+            **_LAUNCH,
         )
     return (
         src2dst,
