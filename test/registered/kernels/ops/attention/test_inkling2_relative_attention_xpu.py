@@ -1,7 +1,7 @@
 """Inkling-2 paged relative-bias attention on XPU against a PyTorch reference.
 
-Split-K decode/verify, sliding windows and anchored bidirectional draft
-blocks.
+Split-K decode/verify, packed GQA, sliding windows, anchored bidirectional
+draft blocks, and binary reuse across token counts.
 """
 
 import pytest
@@ -164,6 +164,74 @@ def test_mtp_bidirectional_block_anchor_keeps_all_draft_keys(length, window):
     torch.testing.assert_close(lse.cpu(), gold_lse, rtol=2e-5, atol=2e-5)
 
 
+# Causal attention runs the packed kernel; counts within one M bucket share a binary.
+@pytest.mark.parametrize(
+    "kernel,heads,counts",
+    [
+        ("_relative_paged_packed", 4, (17, 40)),
+        ("_relative_paged_packed", 4, (17, 24)),
+        ("_relative_paged_packed", 2, (5, 8)),
+    ],
+)
+def test_variable_token_counts_reuse_the_same_attention_binary(
+    monkeypatch, kernel, heads, counts
+):
+    if not torch.xpu.is_available():
+        pytest.skip("XPU required")
+    from sglang.kernels.ops.attention import (
+        inkling2_relative_attention_xpu as attention,
+    )
+
+    target = getattr(attention, kernel)
+    compiled = []
+    original = target.run
+
+    def record(*args, **kwargs):
+        compiled_kernel = original(*args, **kwargs)
+        compiled.append(compiled_kernel.hash)
+        return compiled_kernel
+
+    monkeypatch.setattr(target, "run", record)
+    torch.manual_seed(755)
+    dim, length = 128, 48
+    q = (torch.randn(max(counts), heads, dim) * 0.1).bfloat16()
+    k = (torch.randn(3, 16, 1, dim) * 0.1).bfloat16()
+    v = (torch.randn_like(k.float()) * 0.1).bfloat16()
+    kd, vd = k.to("xpu"), v.to("xpu")
+    table = torch.arange(3, dtype=torch.int32, device="xpu")[None]
+    lens = torch.tensor([length], dtype=torch.int32, device="xpu")
+    for count in counts:
+        query = q[:count].contiguous()
+        rel = torch.zeros(count, heads, 32, dtype=torch.bfloat16)
+        out, lse = relative_paged_attention(
+            query.to("xpu"),
+            kd,
+            vd,
+            rel.to("xpu"),
+            table,
+            lens,
+            torch.tensor([0, count], dtype=torch.int32, device="xpu"),
+            max_query_length=count,
+            scale=dim**-0.5,
+        )
+        keys = k[:, :, 0].reshape(-1, dim).double()
+        values = v[:, :, 0].reshape(-1, dim).double()
+        scores = torch.einsum("qhd,kd->qhk", query.double(), keys) * dim**-0.5
+        visible = (
+            torch.arange(length)[None, :]
+            <= (length - count + torch.arange(count))[:, None]
+        )
+        scores.masked_fill_(~visible[:, None, :], -torch.inf)
+        expected = torch.einsum("qhk,kd->qhd", scores.softmax(-1), values).float()
+        torch.testing.assert_close(out.cpu(), expected, rtol=1e-2, atol=2e-3)
+        torch.testing.assert_close(
+            lse.cpu(), scores.logsumexp(-1).float(), rtol=2e-5, atol=2e-5
+        )
+    assert len(compiled) == 2 and compiled[0] == compiled[1], (
+        "Token count must not force a new device binary"
+    )
+
+
 @pytest.mark.parametrize("window", [-1, 31])
 def test_three_request_heterogeneous_prefill(window):
     """Cover the serving failure's 29+73+73 token layout at TP2 head sizes."""
@@ -229,3 +297,58 @@ def test_three_request_heterogeneous_prefill(window):
         out.float().cpu(), torch.cat(expected), atol=2e-3, rtol=1e-2
     )
     torch.testing.assert_close(lse.cpu(), torch.cat(expected_lse), atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("window", [-1, 1023])
+@pytest.mark.parametrize("splits", [1, 8, 16])
+def test_packed_verify_checkpoint_heads_long_context_splits(window, splits):
+    """Nine verify rows of 24/8 heads over 3,000 cached tokens, packed GQA tile."""
+    if not torch.xpu.is_available():
+        pytest.skip("XPU required")
+    torch.manual_seed(1291)
+    qlen, length, hq, hkv, dim, extent, page = 9, 3000, 24, 8, 128, 128, 64
+    pages = (length + page - 1) // page
+    q = torch.randn(qlen, hq, dim, device="xpu").bfloat16()
+    k = torch.randn(pages, page, hkv, dim, device="xpu").bfloat16()
+    v = torch.randn_like(k)
+    rel = (torch.randn(qlen, hq, extent, device="xpu") * 0.3).bfloat16()
+    table = torch.randperm(pages, device="xpu").to(torch.int32)[None]
+    kc = (
+        k[table[0].long()]
+        .reshape(-1, hkv, dim)[:length]
+        .repeat_interleave(3, dim=1)
+        .float()
+    )
+    vc = (
+        v[table[0].long()]
+        .reshape(-1, hkv, dim)[:length]
+        .repeat_interleave(3, dim=1)
+        .float()
+    )
+    scores = torch.einsum("qhd,khd->qhk", q.float(), kc) * dim**-0.5
+    distance = (length - qlen + torch.arange(qlen, device="xpu"))[
+        :, None
+    ] - torch.arange(length, device="xpu")[None]
+    bias = torch.gather(
+        rel.float(), -1, distance.clamp(0, extent - 1)[:, None].expand(-1, hq, -1)
+    )
+    scores += torch.where(((distance >= 0) & (distance < extent))[:, None], bias, 0)
+    hidden = (distance < 0) | ((distance > window) if window >= 0 else False)
+    scores.masked_fill_(hidden[:, None], -torch.inf)
+    out, lse = relative_paged_attention(
+        q,
+        k,
+        v,
+        rel,
+        table,
+        torch.tensor([length], dtype=torch.int32, device="xpu"),
+        torch.tensor([0, qlen], dtype=torch.int32, device="xpu"),
+        max_query_length=qlen,
+        scale=dim**-0.5,
+        window_left=window,
+        splits=splits,
+    )
+    torch.testing.assert_close(
+        out, torch.einsum("qhk,khd->qhd", scores.softmax(-1), vc), atol=2e-3, rtol=1e-2
+    )
+    torch.testing.assert_close(lse, scores.logsumexp(-1), atol=2e-5, rtol=2e-5)
