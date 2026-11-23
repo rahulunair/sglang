@@ -2179,7 +2179,8 @@ def _set_mha_kv_buffer_prefix_valid(
     if commit_lens.dtype != torch.int32:
         commit_lens = commit_lens.to(torch.int32)
 
-    if not (_is_cuda or _is_hip):
+    # The tiled Triton commit below avoids the host sync of torch.nonzero.
+    if not (_is_cuda or _is_hip or _is_xpu):
         row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
         valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
         valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
@@ -2198,7 +2199,7 @@ def _set_mha_kv_buffer_prefix_valid(
 
     # The tiled kernel takes one ROW_BYTES for both tensors, so an asymmetric V
     # row would be written at K's width and bleed into the next slot. Only this
-    # path needs the gate; the non-CUDA branch above handles both widths.
+    # path needs the gate; the eager branch above handles both widths.
     if pool.v_row_dim != pool.row_dim:
         raise NotImplementedError(
             "prefix-valid commit requires equal-width K/V rows, got "
@@ -2242,8 +2243,8 @@ def _set_mha_kv_buffer_prefix_valid(
             loc_2d,
             commit_lens,
             row_dim=pool.row_dim,
-            k_scale_is_tensor=isinstance(k_scale, torch.Tensor) and k_scale.is_cuda,
-            v_scale_is_tensor=isinstance(v_scale, torch.Tensor) and v_scale.is_cuda,
+            k_scale_is_tensor=isinstance(k_scale, torch.Tensor) and not k_scale.is_cpu,
+            v_scale_is_tensor=isinstance(v_scale, torch.Tensor) and not v_scale.is_cpu,
         )
         return
 
