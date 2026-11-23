@@ -28,7 +28,10 @@ def block_attn_res(
         if scaled_queries is not None
         else queries.float() * (hidden_size**-0.5)
     )
-    from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+    if sources[0].device.type == "xpu":
+        from sglang.kernels.ops.attention.inkling2_attn_res_xpu import attn_res
+    else:
+        from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
 
     return attn_res(
         [x.contiguous() for x in sources],

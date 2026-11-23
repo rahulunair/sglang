@@ -51,3 +51,21 @@ def qk_l2_clip_reference(
             ]
         ).to(dtype)
     return value.reshape(shape)
+
+
+def attn_res_reference(blocks, partial_addend, queries, *, normalize_values=False):
+    assert blocks and queries.ndim == 2 and queries.dtype == torch.float32
+    # The addend is summed in FP32, without an intermediate source-dtype rounding.
+    sources = [x.float() for x in blocks]
+    if partial_addend is not None:
+        sources[-1] = sources[-1] + partial_addend.float()
+    values = torch.stack(sources, dim=0)
+    rstd = torch.rsqrt(values.square().mean(dim=-1) + 1e-6)
+    logits = torch.einsum("std,qd->qst", values, queries) * rstd.unsqueeze(0)
+    # Keep each source reduction contiguous for decode/verify batch invariance.
+    # XPU non-last-axis softmax changes rounding with the token-axis stride.
+    probs = torch.softmax(logits.permute(0, 2, 1).contiguous(), dim=-1).permute(0, 2, 1)
+    if normalize_values:
+        probs = probs * rstd.unsqueeze(0)
+    result = torch.einsum("qst,std->qtd", probs, values)
+    return tuple(result.unbind(0))
