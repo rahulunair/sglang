@@ -4,6 +4,8 @@ Each function is the eager formulation an XPU kernel must match: the activation
 quantizers bit for bit, the reductions to FP32 accumulation order.
 """
 
+import math
+
 import torch
 
 
@@ -108,3 +110,132 @@ def message_controllers_reference(dests, messages, down, gain, forget, eps=1e-6)
 
 
 # One program per row keeps decode and verify rows on the same reduction tree.
+
+
+def fp4round(x):
+    a = x.abs()
+    v = torch.where(
+        a <= 0.25,
+        0.0,
+        torch.where(
+            a < 0.75,
+            0.5,
+            torch.where(
+                a <= 1.25,
+                1.0,
+                torch.where(
+                    a < 1.75,
+                    1.5,
+                    torch.where(
+                        a <= 2.5,
+                        2.0,
+                        torch.where(a < 3.5, 3.0, torch.where(a <= 5.0, 4.0, 6.0)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return torch.where(x < 0, -v, v)
+
+
+def nv_reference(x):
+    """Vectorized NVFP4 activation fake quantization (values, per-row amax)."""
+    x = x.float()
+    z = x.reshape(x.shape[0], -1, 16)
+    a = x.abs().amax(-1)
+    enc = (1536.0 / a).clamp(max=torch.finfo(torch.float32).max)
+    dec = 1.0 / enc
+    mx = z.abs().amax(-1)
+    candidates = []
+    for den in (6.0, 4.0):
+        s = (mx * (enc[:, None] / den)).clamp(max=448.0).to(torch.float8_e4m3fn).float()
+        inv = (1.0 / (s * dec[:, None])).clamp(max=torch.finfo(torch.float32).max)
+        v = fp4round(z * inv[..., None]) * s[..., None]
+        err = (z - v * (a[:, None, None] / 1536.0)).abs().sum(-1)
+        candidates.append((v, err))
+    return torch.where(
+        (candidates[1][1] < candidates[0][1])[..., None],
+        candidates[1][0],
+        candidates[0][0],
+    ).reshape_as(x).to(torch.bfloat16), a
+
+
+def mx_reference(x):
+    """Vectorized MXFP8 activation fake quantization."""
+    x = x.float().reshape(x.shape[0], -1, 32)
+    raw = x.abs().amax(-1) / 448.0
+    p = ((raw.contiguous().view(torch.int32) + 0x007FFFFF) & 0x7F800000) >> 23
+    p = torch.where(raw <= 2.0**-127, 0, p.clamp(max=254))
+    s = torch.where(p == 0, 2.0**-127, (p << 23).contiguous().view(torch.float32))
+    return (
+        (
+            (x / s[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
+            * s[..., None]
+        )
+        .reshape(x.shape[0], -1)
+        .to(torch.bfloat16)
+    )
+
+
+def fp8_round(value):
+    return (
+        torch.tensor(value).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float().item()
+    )
+
+
+def scalar_nv(x):
+    # Scalar, codebook-based reference independent of vectorized implementation.
+    codebook = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+    rows, width = x.shape
+    out = torch.empty((rows, width), dtype=torch.bfloat16)
+    maxima = torch.empty(rows, dtype=torch.float32)
+    for row in range(rows):
+        values = x[row].float().tolist()
+        amax = max(map(abs, values))
+        maxima[row] = amax
+        if amax == 0:
+            out[row].zero_()
+            continue
+        encoder = min(1536.0 / amax, torch.finfo(torch.float32).max)
+        for start in range(0, width, 16):
+            group = values[start : start + 16]
+            maximum = max(map(abs, group))
+            candidates = []
+            for denominator in (6.0, 4.0):
+                scale = fp8_round(min(maximum * encoder / denominator, 448.0))
+                decoded = []
+                for value in group:
+                    normalized = value * encoder / scale if scale else 0.0
+                    magnitude = abs(normalized)
+                    best = min(
+                        range(8), key=lambda i: (abs(codebook[i] - magnitude), i % 2)
+                    )
+                    decoded.append(math.copysign(codebook[best] * scale, value))
+                error = sum(
+                    abs(value - q * amax / 1536.0) for value, q in zip(group, decoded)
+                )
+                candidates.append((error, decoded))
+            chosen = (
+                candidates[1] if candidates[1][0] < candidates[0][0] else candidates[0]
+            )
+            out[row, start : start + 16] = torch.tensor(chosen[1])
+    return out, maxima
+
+
+def scalar_mx(x):
+    rows, width = x.shape
+    out = torch.empty((rows, width), dtype=torch.bfloat16)
+    for row in range(rows):
+        for start in range(0, width, 32):
+            group = x[row, start : start + 32].float().tolist()
+            maximum = max(map(abs, group))
+            exponent = (
+                max(-127, min(127, math.ceil(math.log2(maximum / 448.0))))
+                if maximum
+                else -127
+            )
+            scale = 2.0**exponent
+            out[row, start : start + 32] = torch.tensor(
+                [fp8_round(v / scale) * scale for v in group]
+            )
+    return out
