@@ -100,6 +100,12 @@ class QKL2Clip(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x, *, output_scale=None):
+        if x.device.type == "xpu":
+            from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip_xpu import qk_l2_clip
+
+            return qk_l2_clip(
+                x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale
+            )
         from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip import (
             qk_l2_clip_fwd_cutedsl,
         )

@@ -1,12 +1,13 @@
-"""Inkling-2 RMS norm XPU kernel against its PyTorch reference.
+"""Inkling-2 RMS norm and QK L2 clip XPU kernels against their PyTorch references.
 
 FP32 statistics; BF16 outputs may differ by one BF16 rounding (rel-L2 <= 2e-3).
-Width 2304 is the served hidden size.
+Shapes are the served ones: width 2304, 24 query / 8 KV heads of 128.
 """
 
 import pytest
 import torch
 
+from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip_xpu import qk_l2_clip
 from sglang.kernels.ops.layernorm.inkling2_rms_norm_xpu import rms_norm
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.kernels import inkling2_xpu as ref
@@ -40,3 +41,30 @@ def test_rms_norm(tokens, dtype):
         )
         <= 2e-3
     )
+
+
+@pytest.mark.parametrize("tokens", [1, 9, 37])
+@pytest.mark.parametrize(
+    "heads,width,scale_mode,tau",
+    [
+        (24, 128, 2, True),
+        (8, 128, 0, False),
+        (24, 16, 2, True),
+        (8, 128, 1, False),
+    ],
+)
+def test_qk_l2_clip(tokens, heads, width, scale_mode, tau):
+    torch.manual_seed(heads + width + tokens)
+    projected = (torch.randn(tokens, heads * width + 77, device=DEV) * 4).to(
+        torch.bfloat16
+    )
+    x = projected[:, 5 : 5 + heads * width].reshape(tokens, heads, width)
+    scale = {
+        0: None,
+        1: torch.rand(width, device=DEV) + 0.5,
+        2: torch.rand(heads, width, device=DEV) + 0.5,
+    }[scale_mode]
+    out_scale = torch.rand(tokens, device=DEV) + 0.5 if tau else None
+    got = qk_l2_clip(x, 22.6, 1e-6, scale=scale, output_scale=out_scale)
+    want = ref.qk_l2_clip_reference(x, 22.6, 1e-6, scale=scale, output_scale=out_scale)
+    assert got.shape == want.shape and rel_l2(got, want) <= 2e-3
