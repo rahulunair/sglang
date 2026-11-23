@@ -4,13 +4,17 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.srt.utils import is_xpu
 
 # Below this many rows the Triton _gate_sink_kernel is faster.
 GATE_SINK_CUDA_MIN_ROWS = 64
+_IS_XPU = tl.constexpr(is_xpu())
 
 
 @triton.jit
 def _sigmoid(x):
+    if _IS_XPU:
+        return 1.0 / (1.0 + tl.exp2(-x * 1.4426950408889634))
     exponent = -x * 1.4426950408889634
     exp = tl.inline_asm_elementwise(
         "ex2.approx.f32 $0, $1;",
@@ -256,6 +260,8 @@ def _gate_sink_module(heads, head_dim, group, padded_group):
 
 def _cuda_gate_sink(output, gate, lse, sinks, result, group, padded_group):
     """_gate_sink_kernel in CUDA; False when an operand layout is unsupported."""
+    if output.device.type == "xpu":
+        return False
     heads = sinks.shape[-1]
     head_dim = result.shape[1] // heads
     if not (
