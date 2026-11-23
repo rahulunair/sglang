@@ -375,8 +375,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.num_sim_draws_ahead = 0
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         markov_head = self.draft_model.markov_head
+        # Without NVLink multicast (ROCm, XPU over PCIe) gathering whole step logits
+        # costs more than accepting on the vocab shards.
         self._sharded_accept = (
-            is_hip()
+            (is_hip() or is_xpu())
             and not self._greedy_draft
             and self._acceptance_estimator is None
             and markov_head is not None
