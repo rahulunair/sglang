@@ -1,7 +1,7 @@
 """Inkling-2 loop message controllers and residual add on XPU against references.
 
-Decode (1-9 tokens) and prefill tile configurations (37-2048 tokens), one and
-three controllers; BF16 rounding of the hidden projection bounds rel-L2 at 2e-3.
+Decode (1-9 tokens), batched-verify (37, 512) and prefill (2048) tile configurations,
+one and three controllers; BF16 rounding of the hidden projection bounds rel-L2 at 2e-3.
 """
 
 import pytest
