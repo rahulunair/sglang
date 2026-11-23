@@ -163,6 +163,7 @@ def _packed_block(
     pos,
     live,
     length,
+    anchor_start,
     SP,
     SK0,
     SK1,
@@ -177,6 +178,8 @@ def _packed_block(
     PAGE: tl.constexpr,
     LEFT: tl.constexpr,
     SCALE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    ANCHORED: tl.constexpr,
     WITH_REL: tl.constexpr,
     BN: tl.constexpr,
 ):
@@ -209,13 +212,18 @@ def _packed_block(
     values = tl.where(validkeys[:, None], values, 0.0)
     score = tl.dot(query, tl.trans(keys)) * SCALE
     distance = pos[:, None] - keypos[None, :]
-    visible = live[:, None] & validkeys[None, :] & (distance >= 0)
+    visible = live[:, None] & validkeys[None, :]
+    if CAUSAL:
+        visible = visible & (distance >= 0)
     if LEFT >= 0:
-        visible = visible & (distance <= LEFT)
+        if ANCHORED:
+            visible = visible & (keypos[None, :] >= anchor_start)
+        else:
+            visible = visible & (distance <= LEFT)
     if WITH_REL:
         bias = tl.load(
             Rel + token[:, None] * SR0 + head[:, None] * SR1 + distance,
-            visible & (distance < E),
+            visible & (distance >= 0) & (distance < E),
             other=0.0,
         ).to(tl.float32)
         score = score + bias
@@ -263,6 +271,8 @@ def _relative_paged_packed(
     SCALE: tl.constexpr,
     SPLITS: tl.constexpr,
     HAS_REL: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    ANCHORED: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
 ):
@@ -295,9 +305,17 @@ def _relative_paged_packed(
     first_pos = length - qlen + first_q
     last_pos = tl.minimum(first_pos + BM // GROUP, length) - 1
     low = 0
+    anchor_start = 0
     if LEFT >= 0:
-        low = tl.maximum(first_pos - LEFT, 0) // BN
-    high = last_pos // BN + 1
+        if ANCHORED:
+            anchor_start = tl.maximum(length - qlen - (LEFT + 1), 0)
+            low = anchor_start // BN
+        else:
+            low = tl.maximum(first_pos - LEFT, 0) // BN
+    if CAUSAL:
+        high = last_pos // BN + 1
+    else:
+        high = tl.cdiv(length, BN)
     near = high
     if HAS_REL:
         near = tl.minimum(tl.maximum(first_pos - E, 0) // BN, high)
@@ -320,6 +338,7 @@ def _relative_paged_packed(
             pos,
             live,
             length,
+            anchor_start,
             SP,
             SK0,
             SK1,
@@ -334,6 +353,8 @@ def _relative_paged_packed(
             PAGE,
             LEFT,
             SCALE,
+            CAUSAL,
+            ANCHORED,
             False,
             BN,
         )
@@ -357,6 +378,7 @@ def _relative_paged_packed(
                 pos,
                 live,
                 length,
+                anchor_start,
                 SP,
                 SK0,
                 SK1,
@@ -371,6 +393,8 @@ def _relative_paged_packed(
                 PAGE,
                 LEFT,
                 SCALE,
+                CAUSAL,
+                ANCHORED,
                 True,
                 BN,
             )
@@ -548,7 +572,7 @@ def relative_paged_attention(
             scale,
             window_left,
         )
-    if t and causal and page_size % block_n == 0:
+    if t and page_size % block_n == 0:
         tiles = triton.cdiv(max_query_length, packed_rows // group)
         _relative_paged_packed[(tiles, kvheads * splits, cu_q.numel() - 1)](
             q,
@@ -571,6 +595,8 @@ def relative_paged_attention(
             scale,
             splits,
             rel_bias is not None,
+            causal,
+            window_anchor_at_start,
             packed_rows,
             block_n,
             num_warps=warps,

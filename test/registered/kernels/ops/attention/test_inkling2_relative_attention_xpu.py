@@ -118,7 +118,10 @@ def test_checkpoint_shape_multitile_prefill_and_relative_extent_boundary():
 
 @pytest.mark.parametrize("length", [17, 143])
 @pytest.mark.parametrize("window", [-1, 31])
-def test_mtp_bidirectional_block_anchor_keeps_all_draft_keys(length, window):
+@pytest.mark.parametrize("extent,splits", [(0, 1), (40, 4)])
+def test_mtp_bidirectional_block_anchor_keeps_all_draft_keys(
+    length, window, extent, splits
+):
     if not torch.xpu.is_available():
         pytest.skip("XPU required")
     torch.manual_seed(421)
@@ -142,6 +145,16 @@ def test_mtp_bidirectional_block_anchor_keeps_all_draft_keys(length, window):
         .float()
     )
     scores = torch.einsum("qhd,khd->qhk", q.float(), kc) * (dim**-0.5)
+    rel = None
+    if extent:
+        # Bias only keys behind a query within the extent; later draft keys get none.
+        rel = torch.randn(qlen, hq, extent).bfloat16()
+        distance = (length - qlen + torch.arange(qlen))[:, None] - torch.arange(length)
+        near = (distance >= 0) & (distance < extent)
+        gathered = rel.float().gather(
+            2, distance.clamp(0, extent - 1)[:, None, :].expand(qlen, hq, length)
+        )
+        scores = scores + torch.where(near[:, None, :], gathered, 0.0)
     # All queries share the same context boundary, and see every draft key.
     anchor = max(length - qlen - (window + 1), 0) if window >= 0 else 0
     scores[:, :, :anchor] = -torch.inf
@@ -151,13 +164,14 @@ def test_mtp_bidirectional_block_anchor_keeps_all_draft_keys(length, window):
         q.to("xpu"),
         k.to("xpu"),
         v.to("xpu"),
-        None,
+        rel.to("xpu") if rel is not None else None,
         table.to("xpu"),
         torch.tensor([length], device="xpu", dtype=torch.int32),
         torch.tensor([0, qlen], device="xpu", dtype=torch.int32),
         max_query_length=qlen,
         scale=dim**-0.5,
         window_left=window,
+        splits=splits,
         causal=False,
         window_anchor_at_start=window >= 0,
     )
