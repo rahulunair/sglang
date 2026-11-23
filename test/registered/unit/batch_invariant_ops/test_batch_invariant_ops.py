@@ -6,13 +6,18 @@ import torch
 
 from sglang.srt.batch_invariant_ops import batch_invariant_ops
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 # Note: MI300 (gfx942) has 64KB shared memory limit but kernel needs 66KB
 # MI35x (gfx950/CDNA4) may have different limits - testing on MI35x only
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="nightly-test-1-gpu-amd-mi35x", nightly=True)
+register_xpu_ci(est_time=20, suite="nightly-kernel-main-test-1-gpu-xpu", nightly=True)
 
 device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
 torch.set_default_device(device_type)
@@ -130,6 +135,20 @@ class TestBatchInvariantOps(CustomTestCase):
         finally:
             if original_mode is not None:
                 deep_gemm.use_deterministic_algorithms(original_mode)
+
+    @unittest.skipUnless(device_type == "xpu", "XPU-specific FP32 product precision")
+    def test_float32_products_are_ieee_on_xpu(self):
+        """FP32 mm and bmm keep IEEE FP32 products on XPU; TF32 products lose
+        about three decimal digits, which FP32 residual partials cannot absorb."""
+        generator = torch.Generator(device=device_type).manual_seed(0)
+        a = torch.randn(37, 2304, generator=generator)
+        b = torch.randn(2304, 96, generator=generator)
+        want = a.double() @ b.double()
+        with set_batch_invariant_mode(True):
+            outs = (torch.mm(a, b), torch.bmm(a[None], b[None])[0])
+        for out in outs:
+            rel = ((out.double() - want).norm() / want.norm()).item()
+            self.assertLess(rel, 1e-5)
 
     def test_small_matrices(self):
         """Test batch invariance with small matrix sizes"""

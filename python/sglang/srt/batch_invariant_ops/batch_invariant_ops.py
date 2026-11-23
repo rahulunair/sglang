@@ -11,11 +11,13 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-from sglang.srt.utils import is_gfx95_supported, is_npu
+from sglang.srt.utils import is_gfx95_supported, is_npu, is_xpu
 from sglang.srt.utils.common import calc_diff
 from sglang.srt.utils.device import get_device_core_count, get_dispatch_device_backend
 
 _is_npu = is_npu()
+# XPU: IEEE FP32 products for FP32 inputs, which the Inkling FP32 partials need.
+_IS_XPU = tl.constexpr(is_xpu())
 _is_gfx95 = is_gfx95_supported()
 if _is_npu:
     import torch_npu
@@ -143,7 +145,10 @@ def matmul_kernel_persistent(
             b = tl.load(
                 b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
             )
-            accumulator = tl.dot(a, b, accumulator)
+            if _IS_XPU:
+                accumulator = tl.dot(a, b, accumulator, input_precision="ieee")
+            else:
+                accumulator = tl.dot(a, b, accumulator)
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -167,7 +172,7 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-def _matmul_persistent_configs() -> dict:
+def _matmul_persistent_configs(device_type: str | None = None) -> dict:
     configs = {
         torch.bfloat16: {
             "BLOCK_SIZE_M": 128,
@@ -207,6 +212,10 @@ def _matmul_persistent_configs() -> dict:
             "num_warps": 8,
             "matrix_instr_nonkdim": 16,
         }
+    if device_type == "xpu":
+        # Fixed across batch sizes. Small FP32 residual/controller matrices
+        # otherwise compute mostly padding in the 128x128 policy.
+        configs[torch.float32].update(BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, num_warps=4)
     return configs
 
 
@@ -238,8 +247,11 @@ def _matmul_persistent_triton(
             ),
         )
 
-    configs = _matmul_persistent_configs()
+    config = _matmul_persistent_configs(a.device.type)[a.dtype]
     # print(a.device, b.device, c.device)
+    if a.device.type == "xpu" and a.dtype == torch.bfloat16 and M <= 32:
+        # Keep the K tile and FP32 accumulation order for batch invariance.
+        config.update(BLOCK_SIZE_M=32, BLOCK_SIZE_N=64, num_warps=4)
     matmul_kernel_persistent[grid](
         a,
         b,
@@ -259,7 +271,7 @@ def _matmul_persistent_triton(
         B_LARGE=b.numel() > 2**31,
         C_LARGE=c.numel() > 2**31,
         HAS_BIAS=bias is not None,
-        **configs[a.dtype],
+        **config,
     )
     return c
 
@@ -954,7 +966,10 @@ def bmm_kernel_persistent(
             b = tl.load(
                 b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
             )
-            accumulator = tl.dot(a, b, accumulator)
+            if _IS_XPU:
+                accumulator = tl.dot(a, b, accumulator, input_precision="ieee")
+            else:
+                accumulator = tl.dot(a, b, accumulator)
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -1030,6 +1045,9 @@ def bmm_batch_invariant(a, b, *, out=None):
                 "num_warps": 8,
             },
         }
+        if a.device.type == "xpu":
+            # Same FP32 tiles as matmul_persistent on XPU.
+            configs[torch.float32].update(BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, num_warps=4)
 
         config = configs.get(dtype)
         if config is None:
