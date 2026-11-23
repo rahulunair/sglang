@@ -296,7 +296,11 @@ def linear(
                 enable_fp_fusion=False,
             )
         return out.view(*x.shape[:-1], weight.shape[0])
-    if out_dtype == torch.float32 and x.is_cuda and x.dtype != torch.float32:
+    if (
+        out_dtype == torch.float32
+        and x.device.type in ("cuda", "xpu")
+        and x.dtype != torch.float32
+    ):
         flat = x.reshape(-1, x.shape[-1])
         out = (
             torch.mm(flat, weight.T, out_dtype=torch.float32)
