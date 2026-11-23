@@ -1,6 +1,6 @@
 ---
 title: Inkling-2-Mini
-description: "Deploy Inkling-2-Mini with SGLang — verified launch commands, with and without DSpark speculative decoding, for Thinking Machines' looped NVFP4 / MXFP8 Mixture-of-Experts model on GB300, H200, RTX PRO 6000, RTX 5090, DGX Spark, AMD MI350X / MI355X, and TPU7x."
+description: "Deploy Inkling-2-Mini with SGLang — verified launch commands, with and without DSpark speculative decoding, for Thinking Machines' looped NVFP4 / MXFP8 Mixture-of-Experts model on GB300, H200, RTX PRO 6000, RTX 5090, DGX Spark, AMD MI350X / MI355X, TPU7x, and Intel Arc Pro B70."
 tag: NEW
 ---
 
@@ -88,7 +88,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Loop options.** On a variable-loop checkpoint, the Playground's **Loop Passes** card sets `--inkling2-loop-num-passes` and the **Loop KV Cache** card sets `--inkling2-loop-share-cache`. Fewer passes trade accuracy for speed: on gsm8k, 1 pass scored 84.0% against 88.5% at the default 3. Sharing one K/V cache across passes about doubles the KV pool and scored 90.0%. DSpark accepts shared KV but refuses a non-default pass count at startup.
 
-**Parallelism.** The data-center GPU recipes run TP4 / EP4: one GB300 tray, or half of an 8-GPU H200 or MI350X / MI355X node. RTX PRO 6000, RTX 5090 and DGX Spark run TP1 / EP1 on a single GPU. TPU7x runs TP8 / EP8 on one host. Keep EP equal to TP: the NVFP4 experts cannot be TP-sharded, because their activation scales must cover each expert's full input width.
+**Parallelism.** The data-center GPU recipes run TP4 / EP4: one GB300 tray, or half of an 8-GPU H200 or MI350X / MI355X node. RTX PRO 6000, RTX 5090 and DGX Spark run TP1 / EP1 on a single GPU. TPU7x runs TP8 / EP8 on one host. Intel Arc Pro B70 runs TP2 / EP2 or TP4 / EP4 ([XPU deployment](#xpu)). Keep EP equal to TP: the NVFP4 experts cannot be TP-sharded, because their activation scales must cover each expert's full input width.
 
 **Batch-size-1 decode.** Decode at batch size 1 takes about as long per token as on Inkling-2-Small, because both models make 48 layer visits per token.
 
@@ -121,3 +121,45 @@ Inkling-2-Mini runs on a 4-chip TPU7x slice (one host, 8 TensorCores) as one TP8
 Select **TPU7x** and **DSpark** above for the command. It sets only what Inkling-2-Mini needs; everything else is left at its default. The DSpark draft is bundled in the checkpoint.
 
 The DSpark command was verified with GSM8K and an image-input check; AIME26 and GPQA Diamond were also run with the tuned flags of the Inkling-2-Small recipe `recipe/configs/inkling2/server.py`. The **Balanced** recipe, the same command without speculative decoding, has not been run end to end. Not yet run on TPU7x: contexts above 131072 tokens, the **Loop Passes** and **Loop KV Cache** options, PD disaggregation, and HiCache.
+
+<a id="xpu" />
+
+## 4. Intel Arc Pro B70 (XPU) deployment
+
+Inkling-2-Mini runs on two Arc Pro B70 GPUs as TP2 · EP2 at a 524,288-token context, or on four as TP4 · EP4 at 1,048,576 tokens. Attention uses the `inkling2_xpu` backend (the Xe20 relative-bias kernel for prefill and a Triton split-K kernel for decode and verify), and the routed experts run on sgl-kernel-xpu's Xe20 W4A16 (NVFP4) and W8A16 (MXFP8) grouped GEMMs.
+
+<Note>Needs an sgl-kernel-xpu build with the NVFP4 W4A16 grouped GEMM (`sgl_kernel.moe.W4A16_NVFP4_SUPPORTED`) and relative-bias prefill with softmax LSE (`sgl_kernel.flash_attn.REL_BIAS_LSE_SUPPORTED`).</Note>
+
+```bash Command
+SGLANG_OPT_DSV41_DSPARK_MID_FOLD=1 \
+SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE=1 \
+SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS=1 \
+SGLANG_DSPARK_FUSED_ACCEPT_TAIL=1 \
+SGLANG_OPT_DSV41_DSPARK_POST_FOLD=1 \
+SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE=1 \
+SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE=1 \
+CCL_SYCL_ALLREDUCE_TMP_BUF=1 \
+CCL_SYCL_ALLGATHERV_TMP_BUF=1 \
+CCL_SYCL_REDUCE_SCATTER_TMP_BUF=1 \
+CCL_SYCL_BROADCAST_TMP_BUF=1 \
+CCL_SYCL_ALLTOALL_TMP_BUF=1 \
+ZE_AFFINITY_MASK=0,1 \
+sglang serve --model-path thinkingmachines/Inkling-2-Mini \
+  --device xpu --tp 2 --ep 2 \
+  --attention-backend inkling2_xpu --page-size 64 \
+  --context-length 524288 --max-total-tokens 528384 \
+  --chunked-prefill-size 8192 --mem-fraction-static 0.95 \
+  --swa-full-tokens-ratio 0.03 --max-running-requests 8 \
+  --hybrid-cache-checkpoints-level 2 --max-mamba-cache-size 64 \
+  --speculative-algorithm DSPARK --speculative-num-draft-tokens 8 \
+  --speculative-draft-attention-backend inkling2_xpu \
+  --cuda-graph-config '{"decode":{"backend":"full","bs":[1,2,4,8],"max_bs":8},"prefill":{"backend":"full","bs":[64,128,256,512,1024,2048,4096,8192],"max_bs":8192,"full_prefill_max_req":4,"max_seq_len":8192}}' \
+  --enable-multimodal --reasoning-parser inkling --tool-call-parser inkling2 \
+  --grammar-backend xgrammar --enable-cache-report --watchdog-timeout 1200
+```
+
+For four cards, set `ZE_AFFINITY_MASK=0,1,2,3`, `--tp 4 --ep 4`, `--context-length 1048576` and `--max-total-tokens 1052672`.
+
+**Notes.** Run the server process with a high open-file limit (`ulimit -n 1048576`, or `--ulimit nofile=1048576:1048576` in Docker): oneCCL passes device-memory handles as file descriptors. The `CCL_SYCL_*_TMP_BUF` switches make oneCCL stage eager collectives through its own registered buffers; without them every large eager collective on a new buffer exchanges IPC handles, and that exchange can stall for minutes. Prefix caching keeps cached prompts' sliding-window KV resident, so the window pool is sized at `--swa-full-tokens-ratio 0.03`; with the smaller default, long prompts are split into short chunks. The `SGLANG_*` switches are the DSpark runtime folds the CUDA recipes use, with the commit and accept folded into the verify graph. Prefill batches of up to 8,192 tokens and 4 requests replay captured graphs (about 0.4 GB per GPU); longer sequences run eagerly.
+
+Both shapes were verified with these flags for GSM8K, chat, reasoning, tool calling, image input and prefix-cache reuse: on all 1319 gsm8k questions (sgl-eval, temperature 0, 8192 max tokens) TP2 / 512K scored 92.9% and TP4 / 1M 93.0%. The nightly test `test/registered/xpu/llm_models/test_xpu_inkling2_mini.py` runs both. Not yet run on XPU: the **Balanced** recipe, the **Loop Passes** and **Loop KV Cache** options, PD disaggregation, and HiCache.
