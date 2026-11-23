@@ -1,5 +1,7 @@
 """Paged relative-logit attention, ported from Inkling's online-softmax path."""
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -132,6 +134,8 @@ def _relative_paged(
     tl.store(L + split * T * H + token * H + head, lse, row < qlen)
 
 
+# Page sizes the native Xe20 paged flash attention supports.
+NATIVE_FA_PAGES = (64, 128)
 # (max packed rows, BN, warps) per launch kind, measured on B70 at 24/8 heads
 # (verify: 9 rows; prefill: 2K-4K token chunks).
 PACKED_CONFIG = {
@@ -415,6 +419,52 @@ def _merge_splits(
     )
 
 
+def _native_relative_prefill(
+    q,
+    key_cache,
+    value_cache,
+    rel_bias,
+    page_table,
+    cache_lengths,
+    cu_q,
+    max_query_length,
+    max_cache_length,
+    scale,
+    window_left,
+):
+    """Causal paged prefill on the native Xe20 relative-attention kernel; returns
+    BF16 (tokens, heads, dim) and FP32 (tokens, heads) lse as a strided view."""
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    out, lse = flash_attn_with_kvcache(
+        q,
+        key_cache,
+        value_cache,
+        cache_seqlens=cache_lengths,
+        page_table=page_table,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max_query_length,
+        # The bias shear skips sequences longer than max_seqlen_k.
+        max_seqlen_k=max_cache_length,
+        causal=True,
+        window_size=(window_left, 0),
+        softmax_scale=scale,
+        rel_bias=rel_bias,
+        return_softmax_lse=True,
+    )
+    return out, lse.transpose(0, 1)
+
+
+@functools.cache
+def native_relative_lse_supported() -> bool:
+    try:
+        from sgl_kernel import flash_attn
+    except ImportError:
+        return False
+    # Older sgl-kernel-xpu builds reject return_softmax_lse with rel_bias.
+    return getattr(flash_attn, "REL_BIAS_LSE_SUPPORTED", False)
+
+
 def relative_paged_attention(
     q,
     key_cache,
@@ -430,8 +480,11 @@ def relative_paged_attention(
     splits=1,
     causal=True,
     window_anchor_at_start=False,
+    max_cache_length=None,
 ):
-    """Returns (out, lse): out (tokens, heads, dim) and lse (tokens, heads), FP32."""
+    """Returns (out, lse): out (tokens, heads, dim), FP32 from the Triton kernels and
+    BF16 from the native prefill kernel; lse FP32 (tokens, heads), possibly strided.
+    max_cache_length (host int, >= every cache length) enables the native prefill."""
     if q.device.type != "xpu" or q.dtype != torch.bfloat16:
         raise ValueError("Inkling XPU relative attention requires BF16 XPU queries")
     if key_cache.dtype != q.dtype or value_cache.dtype != q.dtype:
@@ -471,6 +524,30 @@ def relative_paged_attention(
         page_table.stride(0),
     )
     extent = rel_bias.shape[2] if rel_bias is not None else 0
+    if (
+        t
+        and causal
+        and kind == "prefill"
+        and rel_bias is not None
+        and splits == 1
+        and max_cache_length is not None
+        and dim == 128
+        and page_size in NATIVE_FA_PAGES
+        and native_relative_lse_supported()
+    ):
+        return _native_relative_prefill(
+            q,
+            key_cache,
+            value_cache,
+            rel_bias,
+            page_table,
+            cache_lengths,
+            cu_q,
+            max_query_length,
+            max_cache_length,
+            scale,
+            window_left,
+        )
     if t and causal and page_size % block_n == 0:
         tiles = triton.cdiv(max_query_length, packed_rows // group)
         _relative_paged_packed[(tiles, kvheads * splits, cu_q.numel() - 1)](

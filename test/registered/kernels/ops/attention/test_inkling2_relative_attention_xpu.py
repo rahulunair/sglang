@@ -1,7 +1,8 @@
 """Inkling-2 paged relative-bias attention on XPU against a PyTorch reference.
 
-Split-K decode/verify, packed GQA, sliding windows, anchored bidirectional
-draft blocks, and binary reuse across token counts.
+Split-K decode/verify, packed GQA, native Xe20 prefill (with LSE), sliding
+windows, anchored bidirectional draft blocks, and binary reuse across token
+counts.
 """
 
 import pytest
@@ -232,8 +233,9 @@ def test_variable_token_counts_reuse_the_same_attention_binary(
     )
 
 
+@pytest.mark.parametrize("max_cache_length", [None, 73])
 @pytest.mark.parametrize("window", [-1, 31])
-def test_three_request_heterogeneous_prefill(window):
+def test_three_request_heterogeneous_prefill(window, max_cache_length):
     """Cover the serving failure's 29+73+73 token layout at TP2 head sizes."""
     if not torch.xpu.is_available():
         pytest.skip("XPU required")
@@ -292,6 +294,7 @@ def test_three_request_heterogeneous_prefill(window):
         max_query_length=73,
         scale=dim**-0.5,
         window_left=window,
+        max_cache_length=max_cache_length,
     )
     torch.testing.assert_close(
         out.float().cpu(), torch.cat(expected), atol=2e-3, rtol=1e-2
@@ -352,3 +355,78 @@ def test_packed_verify_checkpoint_heads_long_context_splits(window, splits):
         out, torch.einsum("qhk,khd->qhd", scores.softmax(-1), vc), atol=2e-3, rtol=1e-2
     )
     torch.testing.assert_close(lse, scores.logsumexp(-1), atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("window", [-1, 1023])
+@pytest.mark.parametrize(
+    "lengths,queries", [([1000], [300]), ([1200, 333], [1200, 90])]
+)
+def test_prefill_native_relative_attention_with_lse(window, lengths, queries):
+    """Causal prefill on the native relative-attention kernel, with LSE."""
+    if not torch.xpu.is_available():
+        pytest.skip("XPU required")
+    torch.manual_seed(2207)
+    hq, hkv, dim, extent, page = 24, 8, 128, 128, 64
+    pages_per = [(n + page - 1) // page for n in lengths]
+    width = max(pages_per)
+    k = torch.randn(sum(pages_per), page, hkv, dim, device="xpu").bfloat16()
+    v = torch.randn_like(k)
+    table = torch.zeros(len(lengths), width, dtype=torch.int32, device="xpu")
+    perm = torch.randperm(sum(pages_per), device="xpu").to(torch.int32)
+    start = 0
+    for i, n in enumerate(pages_per):
+        table[i, :n] = perm[start : start + n]
+        start += n
+    q = torch.randn(sum(queries), hq, dim, device="xpu").bfloat16()
+    rel = (torch.randn(sum(queries), hq, extent, device="xpu") * 0.3).bfloat16()
+    cu = torch.tensor(
+        [0, *torch.tensor(queries).cumsum(0).tolist()], dtype=torch.int32, device="xpu"
+    )
+    out, lse = relative_paged_attention(
+        q,
+        k,
+        v,
+        rel,
+        table,
+        torch.tensor(lengths, dtype=torch.int32, device="xpu"),
+        cu,
+        max_query_length=max(queries),
+        scale=dim**-0.5,
+        window_left=window,
+        max_cache_length=max(lengths),
+    )
+    row = 0
+    for i, (length, qlen) in enumerate(zip(lengths, queries)):
+        kc = (
+            k[table[i, : pages_per[i]].long()]
+            .reshape(-1, hkv, dim)[:length]
+            .repeat_interleave(3, 1)
+            .float()
+        )
+        vc = (
+            v[table[i, : pages_per[i]].long()]
+            .reshape(-1, hkv, dim)[:length]
+            .repeat_interleave(3, 1)
+            .float()
+        )
+        qs, rs = q[row : row + qlen].float(), rel[row : row + qlen].float()
+        scores = torch.einsum("qhd,khd->qhk", qs, kc) * dim**-0.5
+        distance = (length - qlen + torch.arange(qlen, device="xpu"))[
+            :, None
+        ] - torch.arange(length, device="xpu")[None]
+        bias = torch.gather(
+            rs, -1, distance.clamp(0, extent - 1)[:, None].expand(-1, hq, -1)
+        )
+        scores += torch.where(((distance >= 0) & (distance < extent))[:, None], bias, 0)
+        hidden = (distance < 0) | ((distance > window) if window >= 0 else False)
+        scores.masked_fill_(hidden[:, None], -torch.inf)
+        torch.testing.assert_close(
+            out[row : row + qlen].float(),
+            torch.einsum("qhk,khd->qhd", scores.softmax(-1), vc),
+            atol=1e-2,
+            rtol=2e-2,
+        )
+        torch.testing.assert_close(
+            lse[row : row + qlen], scores.logsumexp(-1), atol=2e-5, rtol=2e-5
+        )
+        row += qlen
