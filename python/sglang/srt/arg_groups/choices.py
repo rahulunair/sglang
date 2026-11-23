@@ -112,6 +112,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    "inkling2_xpu",
 ]
 
 _REMOVED_ATTENTION_BACKENDS = {
@@ -168,6 +169,7 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "trtllm_mha",
     "intel_xpu",
+    "inkling2_xpu",
 ]
 
 DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
@@ -178,6 +180,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "fa4",
     "flashinfer",
     "intel_xpu",
+    "inkling2_xpu",
     "triton",
 ]
 
@@ -333,7 +336,13 @@ add_deterministic_attention_backend_choices = (
     DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend
 )
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = [
+    "ascend",
+    "fa3",
+    "fa4",
+    "triton",
+    "inkling2_xpu",
+]
 add_radix_supported_deterministic_attention_backend_choices = (
     RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend
 )
