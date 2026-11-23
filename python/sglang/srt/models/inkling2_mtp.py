@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -8,6 +9,7 @@ from sglang.kernels.ops.speculative.inkling2_mtp import (
     rnn_gates,
     rnn_inputs,
 )
+from sglang.srt.batch_invariant_ops import set_batch_invariant_mode
 from sglang.srt.distributed.device_communicators.vocab_gather import (
     make_vocab_gather,
 )
@@ -54,17 +56,24 @@ class Inkling2MTPHead(BaseDSparkMarkovHead):
     def refresh_fold(self, weight, multiplier):
         assert self._fold_weight is not None and self._fold_bias is not None
         assert weight.shape == (self._fold_weight.shape[0], self.hidden_size)
-        projection = self.hidden_out.weight.double()
-        bias = self.hidden_out.bias.double()
-        for start in range(0, weight.shape[0], 4096):
-            rows = slice(start, min(start + 4096, weight.shape[0]))
-            head = weight[rows].double()
-            folded_weight, folded_bias = head @ projection, head @ bias
-            if multiplier:
-                folded_weight /= multiplier
-                folded_bias /= multiplier
-            self._fold_weight[rows].copy_(folded_weight)
-            self._fold_bias[rows].copy_(folded_bias)
+        # Preserve the FP64 GPU fold; invariant serving GEMMs do not accept FP64.
+        context = (
+            set_batch_invariant_mode(False)
+            if weight.device.type == "xpu"
+            else nullcontext()
+        )
+        with context:
+            projection = self.hidden_out.weight.double()
+            bias = self.hidden_out.bias.double()
+            for start in range(0, weight.shape[0], 4096):
+                rows = slice(start, min(start + 4096, weight.shape[0]))
+                head = weight[rows].double()
+                folded_weight, folded_bias = head @ projection, head @ bias
+                if multiplier:
+                    folded_weight /= multiplier
+                    folded_bias /= multiplier
+                self._fold_weight[rows].copy_(folded_weight)
+                self._fold_bias[rows].copy_(folded_bias)
 
     def get_prev_embeddings(self, token_ids):
         return self.markov_w1(token_ids.long())
