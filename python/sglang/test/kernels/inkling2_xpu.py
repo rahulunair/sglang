@@ -239,3 +239,74 @@ def scalar_mx(x):
                 [fp8_round(v / scale) * scale for v in group]
             )
     return out
+
+
+def dequant(w, s, fp4):
+    if fp4:
+        table = torch.tensor(
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ]
+        )
+        nibbles = (
+            torch.stack((w & 15, w >> 4), -1).reshape(w.shape[0], w.shape[1], -1).long()
+        )
+        return (table[nibbles] * s.float().repeat_interleave(16, -1)).to(torch.bfloat16)
+    scale = torch.pow(2.0, s.int() - 127).repeat_interleave(32, -1)
+    return (w.float() * scale).to(torch.bfloat16)
+
+
+def experts_reference(m, x, weights, ids, fp4):
+    """FP32 CPU reference of one Inkling routed-expert layer, route by route."""
+    w1 = dequant(m.w13_weight, m.w13_scale, fp4)
+    w2 = dequant(m.w2_weight, m.w2_scale, fp4)
+    q, xa = scalar_nv(x) if fp4 else (scalar_mx(x), None)
+    output = []
+    for t in range(x.shape[0]):
+        parts = []
+        for j in range(ids.shape[1]):
+            e = int(ids[t, j])
+            a = (q[t].float() @ w1[e].float().T).to(torch.bfloat16).float()
+            if fp4:
+                scale = (xa[t] * m.w13_amax[e]) * torch.reciprocal(
+                    1536.0 * m.w13_outer_scale_denominator
+                )
+                a = (a * scale).to(torch.bfloat16).float()
+            g, u = a[::2], a[1::2]
+            h = (
+                (4 * torch.tanh(g / 4) * torch.sigmoid(g))
+                * (25 * torch.tanh(u / 25))
+                * weights[t, j]
+            )
+            q2, ha = (
+                scalar_nv(h.to(torch.bfloat16)[None])
+                if fp4
+                else (scalar_mx(h.to(torch.bfloat16)[None]), None)
+            )
+            d = (q2.float() @ w2[e].float().T).to(torch.bfloat16).float()[0]
+            if fp4:
+                scale = (ha[0] * m.w2_amax[e]) * torch.reciprocal(
+                    1536.0 * m.w2_outer_scale_denominator
+                )
+                d = (d * scale).to(torch.bfloat16).float()
+            parts.append(d)
+        total = torch.zeros_like(parts[0])
+        for part in parts:
+            total = total + part
+        output.append(total)
+    return torch.stack(output).to(torch.bfloat16)
