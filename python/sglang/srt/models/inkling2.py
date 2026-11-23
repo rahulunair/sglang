@@ -164,9 +164,12 @@ class Inkling2DecoderLayer(nn.Module):
         )
         attention = self.attn(attn_input, positions, forward_batch, pass_idx=pass_idx)
         attention = self.attn_sconv(attention, positions, forward_batch)
-        routed = forward_batch.forward_mode.is_decode() or (
-            forward_batch.forward_mode.is_target_verify()
-            and attention.shape[0] <= VERIFY_ROUTED_EPILOGUE_MAX_TOKENS
+        routed = not get_platform().is_xpu and (
+            forward_batch.forward_mode.is_decode()
+            or (
+                forward_batch.forward_mode.is_target_verify()
+                and attention.shape[0] <= VERIFY_ROUTED_EPILOGUE_MAX_TOKENS
+            )
         )
         tokens = attention.shape[0]
         # MTP verify and loop message mixing keep every row.
@@ -190,9 +193,13 @@ class Inkling2DecoderLayer(nn.Module):
             combine=not routed,
             total_tokens=tokens if rows is not None else None,
         )
-        if isinstance(mlp, torch.Tensor) and (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
+        if (
+            not get_platform().is_xpu
+            and isinstance(mlp, torch.Tensor)
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
         ):
             mlp = RoutedOutput(mlp, None, 0)
         if isinstance(mlp, RoutedOutput):
