@@ -464,8 +464,8 @@ class Inkling2Attention(nn.Module):
             )
 
     def _forward(self, hidden_states, positions, forward_batch, *, attn, attn_padded):
-        assert serving_attention_backend(forward_batch) == "fa4", (
-            "Inkling2 requires FA4 attention"
+        assert serving_attention_backend(forward_batch) in ("fa4", "inkling2_xpu"), (
+            "Inkling2 requires FA4 attention (inkling2_xpu on XPU)"
         )
         mxfp8 = get_model().kv_cache_dtype == "mxfp8"
         sources = (
@@ -478,7 +478,8 @@ class Inkling2Attention(nn.Module):
         mode = forward_batch.forward_mode
         verify = mode.is_target_verify()
         compact = (
-            not mxfp8
+            not get_platform().is_xpu
+            and not mxfp8
             and self.fused_decode_prologue
             and (
                 mode.is_decode()
@@ -491,7 +492,8 @@ class Inkling2Attention(nn.Module):
             )
         )
         padded = (
-            attn_padded is not None
+            not get_platform().is_xpu
+            and attn_padded is not None
             and not compact
             and (get_platform().is_sm90 or tokens >= PADDED_DECODE_MIN_TOKENS)
             and (mode.is_decode() or verify)
@@ -609,7 +611,7 @@ class Inkling2Attention(nn.Module):
                 head_groups=head_groups,
             )
         parallel = get_parallel()
-        multicast = parallel.moe_ep_size > 1
+        multicast = parallel.moe_ep_size > 1 and not get_platform().is_xpu
         if self.group_all_reduce or (
             multicast
             and (mode.is_decode() or verify)
